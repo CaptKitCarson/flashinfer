@@ -53,7 +53,9 @@ class ActivationSpec:
 
     ``a16_max_tokens`` forces A16 up to an inclusive token capacity, except
     for an explicit hybrid ``bind(a4_prefill=True)`` selection; zero
-    disables the constraint. Larger calls retain ``mode``.
+    disables the constraint. Larger calls retain ``mode``. An explicit
+    ``plan_execution(activation_mode=...)`` selects an available weight-owner
+    mode independently of this cutoff.
 
     ``a4_prefill=True`` retains calibrated A4 prefill on packed NVFP4 A16
     weights. Calls select it with ``bind(a4_prefill=True)``. Explicit True

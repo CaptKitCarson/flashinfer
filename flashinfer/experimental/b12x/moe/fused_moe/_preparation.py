@@ -198,12 +198,16 @@ def _query(
     routing: RoutingSpec,
     controls: FrozenMapping,
     invocation: FrozenMapping,
+    activation_mode=None,
 ) -> MoeDecodeQuery:
     plan = experts.plan._impl
     quant_modes = tuple(sorted(plan.quant_modes))
     quant_mode = quant_modes[0] if len(quant_modes) == 1 else "multi"
     cutoff = experts.plan.activation.a16_max_tokens
-    if cutoff:
+    if activation_mode is not None:
+        quant_mode = _packed_recipe(experts.plan.source, activation_mode)
+        quant_modes = (quant_mode,)
+    elif cutoff:
         if tokens <= cutoff:
             quant_mode, quant_modes = "w4a16", ("w4a16",)
         else:
@@ -1500,6 +1504,7 @@ def plan(
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | None = None,
     scale_expansion=None,
+    activation_mode=None,
 ):
     """Declare prefill capacity and exact planned variants without GPU work."""
     if not isinstance(experts, PreparedExperts):
@@ -1515,8 +1520,18 @@ def plan(
         and type(invocation["a4_prefill"]) is not bool
     ):
         raise TypeError("a4_prefill must be a boolean or None")
+    if activation_mode is not None:
+        if invocation.get("a4_prefill") is True:
+            raise ValueError(
+                "execution activation_mode cannot be combined with a4_prefill=True"
+            )
+        invocation = FrozenMapping({**invocation.to_dict(), "a4_prefill": False})
     controls = _control_snapshot(experts.plan.activation.a4_prefill)
-    cutoff = min(experts.plan.activation.a16_max_tokens, capacity.max_tokens)
+    cutoff = (
+        min(experts.plan.activation.a16_max_tokens, capacity.max_tokens)
+        if activation_mode is None
+        else 0
+    )
     counts = tuple(
         sorted(
             {
@@ -1566,7 +1581,9 @@ def plan(
 
     def child(tokens):
         expansion = expansions.get(tokens)
-        query = _query(experts, capacity, tokens, routing, controls, invocation)
+        query = _query(
+            experts, capacity, tokens, routing, controls, invocation, activation_mode
+        )
         declaration_invocation = FrozenMapping(
             {
                 **invocation.to_dict(),

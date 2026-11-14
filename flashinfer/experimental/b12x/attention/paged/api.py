@@ -48,6 +48,16 @@ def plan(caps, *, invocation=None, override=None):
 
 
 def bind(plan, **kwargs):
+    """Bind runtime tensors to the declared operand layouts.
+
+    Dense extend accepts BF16 ``relative_bias_factors[T, Hq, 16]`` and
+    ``relative_bias_projection[1024, 16]`` instead of a dense relative bias.
+    For distance ``d = cache_len - q_len + local_query - key_position`` in
+    ``[0, 1024)``, the FP32 dot product of the factors and projection row is
+    rounded to BF16 and added to the scaled QK logit. Other distances get zero
+    bias. Both operands require unit rank strides and positive outer strides.
+    ``attention_sink_bias`` is FP32 ``[Hq]`` or ``[T, Hq]`` for extend.
+    """
     if isinstance(plan, B12XPagedAttentionScratchPlan):
         return plan.bind(**kwargs)
     return _bind(plan, **kwargs)

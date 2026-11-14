@@ -60,6 +60,8 @@ _OPERANDS = (
     "v_descale",
     "attention_sink_bias",
     "relative_attention_bias",
+    "relative_bias_factors",
+    "relative_bias_projection",
 )
 
 

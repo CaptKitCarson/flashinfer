@@ -597,6 +597,8 @@ class B12XPagedAttentionScratch:
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
         relative_attention_bias: torch.Tensor | None = None,
+        relative_bias_factors: torch.Tensor | None = None,
+        relative_bias_projection: torch.Tensor | None = None,
     ) -> "B12XPagedAttentionBinding":
         return build_paged_attention_binding(
             scratch=self,
@@ -616,6 +618,8 @@ class B12XPagedAttentionScratch:
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
             relative_attention_bias=relative_attention_bias,
+            relative_bias_factors=relative_bias_factors,
+            relative_bias_projection=relative_bias_projection,
         )
 
     @torch._dynamo.disable
@@ -1486,6 +1490,8 @@ class B12XPagedAttentionBinding:
     v_descale: torch.Tensor | None = None
     attention_sink_bias: torch.Tensor | None = None
     relative_attention_bias: torch.Tensor | None = None
+    relative_bias_factors: torch.Tensor | None = None
+    relative_bias_projection: torch.Tensor | None = None
     plan: "Plan | None" = None
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1581,6 +1587,8 @@ def build_paged_attention_binding(
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
     relative_attention_bias: torch.Tensor | None = None,
+    relative_bias_factors: torch.Tensor | None = None,
+    relative_bias_projection: torch.Tensor | None = None,
 ) -> B12XPagedAttentionBinding:
     scratch._validate_static_shapes(q, k_cache, v_cache)
     _validate_output(output, scratch=scratch)
@@ -1609,6 +1617,12 @@ def build_paged_attention_binding(
         scratch=scratch,
         name="relative_attention_bias",
     )
+
+    for name, tensor in (
+        ("relative_bias_factors", relative_bias_factors),
+        ("relative_bias_projection", relative_bias_projection),
+    ):
+        _validate_optional_tensor_device(tensor, scratch=scratch, name=name)
 
     metadata = _metadata_tuple(
         page_table=page_table,
@@ -1640,6 +1654,8 @@ def build_paged_attention_binding(
         v_descale=v_descale,
         attention_sink_bias=attention_sink_bias,
         relative_attention_bias=relative_attention_bias,
+        relative_bias_factors=relative_bias_factors,
+        relative_bias_projection=relative_bias_projection,
     )
 
 
@@ -2416,6 +2432,8 @@ class B12XPagedAttentionScratchPlan:
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
         relative_attention_bias: torch.Tensor | None = None,
+        relative_bias_factors: torch.Tensor | None = None,
+        relative_bias_projection: torch.Tensor | None = None,
         q2k_indices: torch.Tensor | None = None,
         metadata_launchers: object | None = None,
         external_schedule: object | None = None,
@@ -2477,6 +2495,8 @@ class B12XPagedAttentionScratchPlan:
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
             relative_attention_bias=relative_attention_bias,
+            relative_bias_factors=relative_bias_factors,
+            relative_bias_projection=relative_bias_projection,
             q2k_indices=q2k_indices,
         )
         if (
@@ -2797,6 +2817,8 @@ def make_compile_bindings(
                 "v_descale",
                 "attention_sink_bias",
                 "relative_attention_bias",
+                "relative_bias_factors",
+                "relative_bias_projection",
             )
         },
     )
@@ -2820,8 +2842,30 @@ def variant_key(binding: B12XPagedAttentionBinding) -> Hashable:
         binding.q2k_indices is not None,
         binding.k_descale is not None,
         binding.v_descale is not None,
-        binding.attention_sink_bias is not None,
+        # A per-row sink (rank 2) is indexed differently from a per-head one.
+        (
+            2
+            if binding.attention_sink_bias is not None
+            and binding.attention_sink_bias.ndim == 2
+            else binding.attention_sink_bias is not None
+        ),
         binding.relative_attention_bias is not None,
+        (
+            None
+            if binding.relative_bias_factors is None
+            else (
+                tuple(binding.relative_bias_factors.shape),
+                tuple(binding.relative_bias_factors.stride()),
+            )
+        ),
+        (
+            None
+            if binding.relative_bias_projection is None
+            else (
+                tuple(binding.relative_bias_projection.shape),
+                tuple(binding.relative_bias_projection.stride()),
+            )
+        ),
     )
     layout = (
         tuple(binding.q.stride()),
