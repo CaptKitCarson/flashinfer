@@ -116,6 +116,7 @@ class _Discovery:
     candidates: tuple
     key: str | None
     cache: object | None
+    cache_checked: bool = False
     lock: object | None = None
     batches: list = field(default_factory=list)
     submitted: bool = False
@@ -1922,13 +1923,17 @@ class PreparationJob:
         if wait:
             self._candidates_described = 0
         if state.cache is not None and state.lock is None:
+            admitted = wait or len(self._discovery_locks) < max(
+                1, self.session.compile_workers
+            )
+            if state.cache_checked and not admitted:
+                return
             record = state.cache.load_discovery(state.key)
+            state.cache_checked = True
             if record is None:
                 # Bound open discovery descriptors while compiler work is pending.
                 # Required discovery bypasses admission so the active race can progress.
-                if not wait and len(self._discovery_locks) >= max(
-                    1, self.session.compile_workers
-                ):
+                if not admitted:
                     return
                 lock = state.cache.discovery_lock(state.key)
                 while True:

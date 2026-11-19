@@ -55,8 +55,29 @@ def test_candidate_identity_ignores_metadata_reference_sharing(tmp_path):
 
 @pytest.mark.parametrize("workers", [1, 4])
 @pytest.mark.parametrize("complete", [False, True])
-def test_discovery_pipeline_bounds_open_locks(tmp_path, monkeypatch, workers, complete):
-    resource = pytest.importorskip("resource")
+def test_discovery_pipeline_bounds_open_locks(tmp_path, workers, complete):
+    pytest.importorskip("resource")
+    _run_offline_worker(
+        f"""
+        from pathlib import Path
+        import pytest
+        from tests.experimental.b12x.preparation.test_parallel_discovery import (
+            _check_discovery_pipeline_bounds_open_locks,
+        )
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            _check_discovery_pipeline_bounds_open_locks(
+                Path({str(tmp_path)!r}), monkeypatch, {workers}, {complete}
+            )
+        """
+    )
+
+
+def _check_discovery_pipeline_bounds_open_locks(
+    tmp_path, monkeypatch, workers, complete
+):
+    import resource
+
     from b12x._lib.compile_pool import CompilationPlan
     from b12x.preparation import DetectedDevice
     from b12x.preparation import session as session_module
@@ -96,12 +117,22 @@ def test_discovery_pipeline_bounds_open_locks(tmp_path, monkeypatch, workers, co
         job._pipeline = finish(job._configure(session_module._coalesce_requests(items)))
         job._selections = {}
         cache = engine._race_progress_cache()
+        lookups = []
+        cache.connection.set_trace_callback(
+            lambda statement: lookups.append(statement)
+            if statement.startswith("SELECT payload FROM discoveries_v1")
+            else None
+        )
         engine.device = DetectedDevice(0, None)
         monkeypatch.setattr(engine, "_compiler", lambda: Discovery())
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (min(limits[0], 128), limits[1]))
             finish(job._pump_pipeline(None))
             assert len(job._discovery_locks) == workers
+            initial_lookups = len(lookups)
+            for _ in range(8):
+                finish(job._pump_pipeline(None))
+            assert len(lookups) == initial_lookups
             # Required discovery progresses even when speculative discovery is full.
             current = job._pipeline[-1]
             steps = job._describe_candidates(current)
@@ -124,6 +155,82 @@ def test_discovery_pipeline_bounds_open_locks(tmp_path, monkeypatch, workers, co
                     pass
         finally:
             resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+            engine.device = DetectedDevice(None, None)
+
+
+@pytest.mark.parametrize(
+    "publish_before_lookup, required", [(True, False), (False, False), (False, True)]
+)
+def test_full_discovery_pipeline_observes_peer_cache(
+    tmp_path, monkeypatch, publish_before_lookup, required
+):
+    from b12x._lib.compile_pool import CompilationPlan
+    from b12x.preparation import DetectedDevice
+    from b12x.preparation import session as session_module
+    from b12x.preparation._race_cache import RaceCache
+    from .test_defaults import Query
+
+    pending = True
+    submitted = []
+
+    class Discovery:
+        def describe(self, jobs):
+            submitted.extend(job.args[0] for job in jobs)
+            return tuple(jobs)
+
+        def descriptions(self, jobs):
+            return None if pending else tuple(CompilationPlan(job, ()) for job in jobs)
+
+    monkeypatch.setattr(
+        session_module, "discovery_key", lambda rows, target: str(rows[0][2][0].args[0])
+    )
+    items = []
+    for index in range(2):
+        item = request(name=str(index), tuning=contract())
+        items.append(
+            replace(
+                item,
+                plan=replace(
+                    item.plan,
+                    query=Query(index + 1),
+                    _compile_jobs=lambda config, device, index=index: (
+                        CompileJob.create("test.factory:compile", index, config.width),
+                    ),
+                ),
+            )
+        )
+
+    with session(tmp_path, compile_workers=1) as engine:
+        job = engine.begin(items)
+        first, target = finish(job._configure(session_module._coalesce_requests(items)))
+        cache = engine._race_progress_cache()
+        peer = RaceCache(cache.path)
+        engine.device = DetectedDevice(0, None)
+        monkeypatch.setattr(engine, "_compiler", lambda: Discovery())
+        try:
+            finish(job._advance_discovery(first, wait=False))
+            assert len(job._discovery_locks) == 1
+            if not publish_before_lookup:
+                finish(job._advance_discovery(target, wait=False))
+                assert target.candidate_program_identity is None
+            peer.save_discovery(
+                "1",
+                {
+                    "identity": "peer-programs",
+                    "programs": [[[]] for _ in target.candidates],
+                },
+            )
+            finish(job._advance_discovery(target, wait=required))
+            if not publish_before_lookup and not required:
+                assert target.candidate_program_identity is None
+                pending = False
+                finish(job._advance_discovery(first, wait=False))
+                assert not job._discovery_locks
+                finish(job._advance_discovery(target, wait=False))
+            assert target.candidate_program_identity == "peer-programs"
+            assert submitted and set(submitted) == {0}
+        finally:
+            peer.close()
             engine.device = DetectedDevice(None, None)
 
 
@@ -313,7 +420,12 @@ def test_real_mhc_discovery_matches_serial_without_cuda_or_compilation():
         scope = PreparationProgramCache()
         with scope.activate():
             shared = [describe_compilation(job) for job in jobs]
-            assert scope._caches[_preparation._fake_operands]._misses == 2
+            operands = scope._caches[_preparation._fake_operands]
+            assert operands._misses == 4
+            assert sorted(
+                tuple(value.tensors["partials"].shape)
+                for value in operands._values.values()
+            ) == [(3584, 80, 25)] * 2 + [(3584, 160, 26)] * 2
             evict_unretained(p for description in shared for p in description.programs)
         assert shared == expected
         scope.clear()
