@@ -60,7 +60,7 @@ def declarations(rows):
 def coordinate(progress):
     if progress.ready_collective_tuning is not None:
         value = progress.ready_collective_tuning
-        return (value, value)
+        return (value,) * len(value.ranks)
     if progress.ready_collectives:
         return progress.ready_collectives[0].key
 
@@ -418,6 +418,91 @@ def test_plain_buckets_follow_bytes_and_preserve_collective_semantics():
     assert first.identity != _bucket(query((32, 5120), world_size=2)).identity
     assert first.identity["upper_bytes"] == 48 * 8192
     assert _bucket(query((160, 5120))).identity["upper_bytes"] == 256 * 8192
+
+
+def test_tp4_twoshot_reuses_complete_interval_winner(tmp_path, host_races):
+    from b12x.comm.pcie._collective_tuning import (
+        CollectiveConfig,
+        CollectiveQuery,
+        TUNING,
+    )
+    from b12x.preparation import (
+        DetectedDevice,
+        DeviceIdentity,
+        MemoryRequirements,
+        Plan,
+    )
+
+    validated = []
+    items = []
+    ranks = tuple(range(4))
+    for elements in (4160, 4168):
+        call = dict(
+            dtype="bfloat16",
+            shape=(elements,),
+            threads=128,
+            block_limit=8,
+            row_elems=4096,
+            transport="push",
+        )
+        native = dict(
+            surface="PCIeTwoShotBF16.all_reduce",
+            world_size=4,
+            rank=0,
+            topology="pcie_ipc",
+            setup={},
+        )
+        query = CollectiveQuery(
+            operation="all_reduce",
+            world_size=4,
+            rank=0,
+            alternatives=FrozenMapping(
+                {
+                    "twoshot": dict(native, call=call),
+                    "twoshot_pairwise": dict(
+                        native, call=dict(call, payload_schedule="pairwise")
+                    ),
+                }
+            ),
+            default=CollectiveConfig(implementation="twoshot", threads=128, blocks=8),
+        )
+
+        def benchmark(state, elements=elements):
+            return PreparedCall(
+                run=lambda: None,
+                output=6 if state.implementation == "twoshot_pairwise" else 7,
+                produce=lambda: None,
+                validate=lambda: validated.append((elements, state)),
+            )
+
+        plan = Plan(
+            contract=TUNING,
+            query=query,
+            _compile_jobs=lambda config, device: (),
+            _memory_requirements=lambda config, device: MemoryRequirements(),
+            _materialize=lambda selection, device: selection.config,
+            _benchmark_call=benchmark,
+        )
+        name = str(elements)
+        items.append(
+            plan.request(
+                name=name,
+                collective=CollectiveRequirement(name, ranks),
+                prepare_call=lambda state: PreparedCall(run=lambda: None),
+            )
+        )
+
+    with session(tmp_path, prime=False) as engine:
+        engine.device = DetectedDevice(
+            None, DeviceIdentity("nvidia", (12, 0), 148, "test SM120")
+        )
+        result = engine.prepare(items, coordinator=coordinate)
+        winner = result.selections["4168"].config
+        assert winner.implementation == "twoshot_pairwise"
+        assert result.coverage["4168"]["measured_count"] > 0
+        assert result.coverage["4160"]["measured_count"] == 0
+        assert result.selections["4160"].config == winner
+        assert [config for size, config in validated if size == 4160] == [winner]
 
 
 def test_finalist_policy_preserves_full_families_and_cached_candidate_indices(

@@ -475,6 +475,20 @@ def _collective_signature(query):
     )
 
 
+def _grid_bucket(size, identity):
+    step = max(16, (1 << (size.bit_length() - 1)) // 16)
+    return CollectiveBucket(
+        identity=identity,
+        size_bytes=size,
+        parameters=tuple(knob.name for knob in TUNING.knobs),
+        limit=8,
+        grid=CollectiveGrid(
+            upper_bytes=-(-size // step) * step,
+            band=(size.bit_length() - 1) // 2,
+        ),
+    )
+
+
 def _island_bucket(query):
     from math import prod
 
@@ -505,21 +519,7 @@ def _island_bucket(query):
             del call["active_blocks"]
     if len(sizes) != 1:
         raise ValueError("collective alternatives disagree on payload size")
-    size = sizes.pop()
-    step = max(16, (1 << (size.bit_length() - 1)) // 16)
-    return CollectiveBucket(
-        identity=dict(
-            version=2,
-            signature=signature,
-        ),
-        size_bytes=size,
-        parameters=tuple(knob.name for knob in TUNING.knobs),
-        limit=8,
-        grid=CollectiveGrid(
-            upper_bytes=-(-size // step) * step,
-            band=(size.bit_length() - 1) // 2,
-        ),
-    )
+    return _grid_bucket(sizes.pop(), dict(version=2, signature=signature))
 
 
 def _bucket(query):
@@ -562,6 +562,18 @@ def _bucket(query):
     if len(sizes) != 1:
         raise ValueError("collective alternatives disagree on payload size")
     size = sizes.pop()
+    identity = dict(
+        operation=query.operation,
+        world_size=query.world_size,
+        inplace=query.inplace,
+        alternatives=alternatives,
+    )
+    if "twoshot_pairwise" in alternatives:
+        twoshot = query.alternatives["twoshot_pairwise"]
+        return _grid_bucket(
+            size,
+            dict(version=2, **identity, row_elems=twoshot["call"]["row_elems"]),
+        )
     units = -(-size // 8192)
     ladder = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)
     upper = next((value for value in ladder if value >= units), None)
@@ -570,11 +582,8 @@ def _bucket(query):
     return CollectiveBucket(
         identity=dict(
             version=1,
-            operation=query.operation,
-            world_size=query.world_size,
-            inplace=query.inplace,
+            **identity,
             upper_bytes=upper * 8192,
-            alternatives=alternatives,
         ),
         size_bytes=size,
         parameters=("implementation",),

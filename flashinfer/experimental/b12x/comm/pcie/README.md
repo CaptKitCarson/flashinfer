@@ -94,21 +94,23 @@ per rank. The channel owns the stream and events until queued work drains during
 close. The transport advances the SM protocol's buffer generations and
 communication epochs so serialized calls can alternate transports.
 
-Default-effort plain all-reduce tuning calibrates transfer-size buckets before
-restricting exact-shape races to two families. Bucket upper bounds are
+For plain all-reduce catalogs without pairwise two-shot, default effort
+calibrates transfer-size buckets before restricting exact-shape races to two
+families. Bucket upper bounds are
 `1, 2, 4, 8, 16, 32, 48, 64, 96, 128` units of 8 KiB, then powers of two.
 Within a preparation batch, the largest declared payload in each bucket races
-all eligible families first. On TP4, direct and pairwise BF16 two-shot push
-compete as separate families. The winning family and the fastest other family
+all eligible families first. The winning family and the fastest other family
 remain eligible for every subsequent request in that bucket; each request
 still races all their eligible thread counts and block grids at its actual shape.
 Across preparation batches in one session, the first completed calibration for
 a bucket supplies its shortlist. Buckets are independent for each ordered GPU
 group, dtype, aliasing contract, transport catalog, and staging-storage geometry.
 
-Default-effort IslandRS all-reduce tuning groups contiguous BF16 payloads into
+IslandRS and TP4 BF16 push all-reduce catalogs with pairwise two-shot use the
+same default-effort tuning policy. It groups compatible BF16 payloads into
 sixteen intervals per power-of-two size range, with a minimum interval width of
-16 bytes. The largest declared payload in each interval represents that interval.
+16 bytes. Within a preparation batch, the largest compatible payload in each
+interval represents that interval.
 The smallest representative and each power-of-four size band's largest
 representative race the complete eligible catalog. Other representatives race
 the union of the best eight configurations from each bracketing full search.
@@ -120,9 +122,9 @@ The complete catalog remains available for program discovery and rank agreement.
 
 Calibration shortlists are saved with their representative selections. Exact
 selections include the calibration's program-aware cache identity and retained
-choices, so a changed calibration cannot reuse an incompatible selection. IslandRS
-records include their bracketing or interval representative's decisions. Request
-labels do not affect cache identity. Calibration groups retain the ordered ranks,
+choices, so a changed calibration cannot reuse an incompatible selection. Fine
+interval records include their bracketing or interval representative's decisions.
+Request labels do not affect cache identity. Calibration groups retain the ordered ranks,
 GPU identities, eligible configurations, layouts, aliasing, and owner geometry.
 Audit effort measures the unrestricted catalog. Explicit pins and disabled
 tuning bypass calibration. Caller-supplied benchmark contexts and dependent
