@@ -1,6 +1,7 @@
 """Eight-batch TP16 island reduction using local SM writes and cross-root DMA."""
 
 from functools import partial
+from weakref import finalize
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -193,13 +194,22 @@ class PacketTransport:
             except BaseException:
                 cuda.cuStreamDestroy(handle)
                 raise
-        self._handle = handle
+
+        def release():
+            with torch.cuda.device(device):
+                (status,) = cuda.cuStreamDestroy(handle)
+            if status != cuda.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(
+                    f"destroying the island packet stream failed: {status}"
+                )
+
+        self.stream._b12x_release = finalize(self.stream, release)
+        self.stream._b12x_release.atexit = False
 
     def close(self):
-        with torch.cuda.device(self.stream.device):
-            (status,) = cuda.cuStreamDestroy(self._handle)
-        if status != cuda.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"destroying the island packet stream failed: {status}")
+        if self.stream is not None:
+            self.stream._b12x_release()
+            self.stream = None
 
 
 class PacketPrograms:

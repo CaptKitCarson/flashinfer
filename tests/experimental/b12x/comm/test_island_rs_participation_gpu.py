@@ -8,6 +8,54 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.skipif(
+    os.getenv("B12X_RUN_COLLECTIVE_TUNING_TEST") != "1",
+    reason="requires explicitly assigned CUDA devices",
+)
+@pytest.mark.parametrize("release", ["close", "last_reference"])
+def test_packet_stream_releases_on_its_device(monkeypatch, release):
+    import gc
+    import weakref
+
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
+    from b12x.comm.pcie._island_copy import PacketTransport
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    destroyed = []
+    destroy = cuda.cuStreamDestroy
+
+    def observe_destroy(stream):
+        device = torch.cuda.current_device()
+        result = destroy(stream)
+        destroyed.append((int(stream), device, result))
+        return result
+
+    monkeypatch.setattr(cuda, "cuStreamDestroy", observe_destroy)
+    with torch.cuda.device(0):
+        values = torch.ones(1, device="cuda:0")
+        transport = PacketTransport(values.device, CudaRTLibrary())
+        handle = cuda.CUstream(transport.stream.cuda_stream)
+        stream_ref = weakref.ref(transport.stream)
+        assert cuda.cuStreamQuery(handle)[0] == cuda.CUresult.CUDA_SUCCESS
+    try:
+        with torch.cuda.device(1):
+            if release == "close":
+                transport.close()
+                transport.close()
+            else:
+                del transport
+                gc.collect()
+            assert torch.cuda.current_device() == 1
+        assert stream_ref() is None
+        assert destroyed == [(int(handle), 0, (cuda.CUresult.CUDA_SUCCESS,))]
+    finally:
+        if release == "close":
+            transport.close()
+
+
 def _worker(rank, directory, count, threads, cases, hybrid):
     import torch
     import torch.distributed as dist
