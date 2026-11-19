@@ -508,7 +508,6 @@ class PreparationSession:
         self._tuning_rank = 0
         self._tuning_ranks = (0,)
         self._tuning_cache_synchronized = False
-        self._collective_buckets = {}
         self.session_id = uuid.uuid4().hex
         self.state = "OPEN"
 

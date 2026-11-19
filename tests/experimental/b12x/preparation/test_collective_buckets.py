@@ -1,4 +1,4 @@
-"""Collective calibration shortlists parameter projections before exact-query races."""
+"""Collective preparation calibrates payload intervals and validates their winners."""
 
 from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
@@ -18,43 +18,6 @@ from b12x.preparation import (
 from b12x.preparation import _collective
 from .test_defaults import Query, contract
 from .test_session import _deterministic_timer, request, session
-
-
-def declarations(rows):
-    from b12x.preparation._efficiency import capture_autotune_effort
-
-    tuning = replace(
-        contract(),
-        parameters=lambda query, device: ParameterSpace(
-            knobs=contract().knobs, autotune_effort=capture_autotune_effort()
-        ),
-        collective_signature=lambda query: query.rows,
-        collective_bucket=lambda query: CollectiveBucket(
-            parameters=("width",),
-            identity={"upper": 8 if query.rows <= 8 else 16},
-            size_bytes=query.rows,
-            limit=2,
-        ),
-    )
-    result = []
-    for row in rows:
-        item = request(
-            name=f"rows-{row}",
-            tuning=tuning,
-            collective=CollectiveRequirement(f"group/{row}", (0, 1)),
-            benchmark=lambda state: PreparedCall(
-                run=lambda: state.value, output=state.value, produce=lambda: None
-            ),
-        )
-        result.append(
-            replace(
-                item,
-                plan=replace(
-                    item.plan, query=Query(row), _benchmark_call=item.benchmark_call
-                ),
-            )
-        )
-    return tuple(result)
 
 
 def coordinate(progress):
@@ -77,252 +40,120 @@ class LaunchConfig:
     blocks: int
 
 
-def launch_declarations(rows, *, parameters=("width",), blocks=lambda query: (1, 2)):
-    from b12x.preparation._efficiency import capture_autotune_effort
-
-    knobs = (Knob(name="width", values=(1, 2, 4)), Knob(name="blocks", values=None))
-    items = []
-    for item in declarations(rows):
-        tuning = replace(
-            item.plan.contract,
-            config_fields=frozenset(("width", "blocks")),
-            encode_config=asdict,
-            decode_config=lambda payload: LaunchConfig(**payload),
-            validate_config=lambda query, config, device: None,
-            default_config=lambda query, device: LaunchConfig(2, 1),
-            knobs=knobs,
-            parameters=lambda query, device: ParameterSpace(
-                knobs=(knobs[0], replace(knobs[1], values=blocks(query))),
-                autotune_effort=capture_autotune_effort(),
-            ),
-            materialize=lambda query, device, assignment: LaunchConfig(**assignment),
-            collective_bucket=lambda query: CollectiveBucket(
-                parameters=parameters,
-                identity={"upper": 8},
-                size_bytes=query.rows,
-                limit=2,
-            ),
-        )
-        items.append(replace(item, plan=replace(item.plan, contract=tuning)))
-    return tuple(items)
-
-
 @pytest.mark.parametrize(
     "changes",
     [
         {"identity": {}},
         {"size_bytes": 0},
         {"size_bytes": True},
+        {"size_bytes": 9},
         {"limit": 0},
         {"limit": 1.5},
-        {"parameters": ()},
-        {"parameters": ("width", "width")},
-        {"parameters": ("not-an-identifier",)},
     ],
 )
-def test_bucket_descriptor_rejects_invalid_identity_size_and_projection(changes):
-    payload = dict(identity={"upper": 8}, size_bytes=5, parameters=("width",), limit=2)
+def test_bucket_rejects_invalid_identity_size_and_limit(changes):
+    payload = dict(
+        identity={"operation": "arithmetic"},
+        size_bytes=5,
+        limit=2,
+        grid=CollectiveGrid(upper_bytes=8, band=1),
+    )
     with pytest.raises(ValueError):
         CollectiveBucket(**(payload | changes))
 
 
-@pytest.mark.parametrize(
-    "callback,error,match",
-    [
-        (lambda query: ("width", {}, 5), TypeError, "CollectiveBucket"),
-        (
-            lambda query: CollectiveBucket(
-                identity={"upper": 8}, size_bytes=5, parameters=("missing",), limit=2
-            ),
-            ValueError,
-            "absent from its parameter space",
-        ),
-    ],
-)
-def test_invalid_bucket_callbacks_fail_before_racing(
-    tmp_path, host_races, callback, error, match
-):
-    item = declarations((5,))[0]
+def test_invalid_bucket_callback_fails_before_racing(tmp_path, host_races):
+    validated = []
+    (item,) = grid_declarations((5,), validated)
     item = replace(
         item,
         plan=replace(
             item.plan,
-            contract=replace(
-                item.plan.contract,
-                collective_bucket=callback,
-            ),
+            contract=replace(item.plan.contract, collective_bucket=lambda query: ()),
         ),
     )
     with session(tmp_path) as engine:
-        with pytest.raises(error, match=match):
+        with pytest.raises(TypeError, match="CollectiveBucket"):
             engine.prepare((item,), coordinator=coordinate)
-        assert not engine._collective_buckets
+    assert validated == []
 
 
-def test_calibration_precedes_requests_and_cached_calibration_reuses_shortlist(
-    tmp_path, host_races
+@pytest.mark.parametrize("mode", ("custom_benchmark", "dependency", "pin"))
+def test_custom_benchmark_dependencies_and_pins_bypass_calibration(
+    tmp_path, host_races, mode
 ):
-    for cached in (False, True):
-        catalogs = []
-
-        def record(progress):
-            value = progress.ready_collective_tuning
-            if value is not None and value.step == "catalog":
-                catalogs.append(value.key)
-            return coordinate(progress)
-
-        with session(tmp_path) as engine:
-            snapshots = []
-            result = engine.prepare(
-                declarations((3, 5, 11, 13)),
-                coordinator=record,
-                progress=snapshots.append,
+    items = []
+    for item in grid_declarations((17, 19), []):
+        if mode == "pin":
+            item = replace(item, plan=replace(item.plan, override=LaunchConfig(4, 1)))
+        elif mode == "dependency":
+            item = replace(item, dependencies=("input",))
+        else:
+            item = replace(
+                item, benchmark_call=lambda state, call=item.benchmark_call: call(state)
             )
-            assert catalogs == ["group/5", "group/13", "group/3", "group/11"]
-            assert result.benchmarked_candidates == (0 if cached else 10)
-            assert result.cache_hits == (4 if cached else 0)
-            assert all(
-                p.completed_candidates <= p.total_candidates
-                for p in snapshots
-                if p.total_candidates is not None
-            )
-            assert all(item.config.width == 2 for item in result.selections.values())
-            assert len(engine._collective_buckets) == 2
-            assert all(
-                value[1] == ({"width": 2}, {"width": 1})
-                for value in engine._collective_buckets.values()
-            )
-            later = engine.prepare(declarations((7,)), coordinator=coordinate)
-            assert later.benchmarked_candidates == (0 if cached else 2)
-            repeat = engine.prepare(declarations((5,)), coordinator=coordinate)
-            assert repeat.benchmarked_candidates == 0
-            assert repeat.cache_hits == 1
-
-
-@pytest.mark.parametrize("effort,count", (("audit", 12), ("off", 0)))
-def test_effort_preserves_full_audit_and_untuned_defaults(
-    tmp_path, host_races, effort, count
-):
-    with autotune_effort(effort), session(tmp_path) as engine:
-        result = engine.prepare(declarations((3, 5, 11, 13)), coordinator=coordinate)
-        assert result.benchmarked_candidates == count
-        assert not engine._collective_buckets
-
-
-def test_cancelled_calibration_does_not_publish_partial_family_results(
-    tmp_path, host_races
-):
-    def cancel(progress):
-        value = progress.ready_collective_tuning
-        if value is not None and value.step == "bound/1":
-            value = replace(
-                value, payload=FrozenMapping({**value.payload, "cancel": True})
-            )
-            return (value, value)
-        return coordinate(progress)
-
-    with session(tmp_path) as engine:
-        result = engine.prepare(declarations((5,)), coordinator=cancel)
-        assert result.selections["rows-5"].source == "default"
-        assert not engine._collective_buckets
-
-
-def test_custom_benchmark_does_not_share_builtin_calibration(tmp_path, host_races):
-    items = tuple(
-        replace(
-            item,
-            benchmark_call=lambda state: PreparedCall(
-                run=lambda: state.value, output=state.value, produce=lambda: None
+        items.append(item)
+    if mode == "dependency":
+        items.insert(
+            0,
+            request(
+                name="input",
+                tuning=replace(contract(values=(2,)), component_id="test.input"),
             ),
         )
-        for item in declarations((3, 5))
-    )
     with session(tmp_path) as engine:
         result = engine.prepare(items, coordinator=coordinate)
-        assert result.benchmarked_candidates == 6
-        assert not engine._collective_buckets
+    if mode == "pin":
+        assert result.benchmarked_candidates == 0
+        assert all(
+            choice.config == LaunchConfig(4, 1) for choice in result.selections.values()
+        )
+    else:
+        assert result.benchmarked_candidates == 12
 
 
-def test_shortlist_retains_every_launch_configuration_of_both_families(
-    tmp_path, host_races
-):
-    with session(tmp_path) as engine:
-        result = engine.prepare(launch_declarations((3, 5)), coordinator=coordinate)
-        assert result.benchmarked_candidates == 10
-        assert result.coverage["rows-5"]["measured_count"] == 6
-        assert result.coverage["rows-3"]["measured_count"] == 4
-        assert result.coverage["rows-3"]["bucket_pruned_count"] == 2
-
-
-def test_complete_projection_races_each_shape_and_reuses_cached_choices(
-    tmp_path, host_races
-):
+@pytest.mark.parametrize("limit", (6, 8))
+def test_small_competing_catalog_reuses_complete_winner(tmp_path, host_races, limit):
     validated = []
-
-    def materialize(selection, device):
-        pair = (selection.config.width, selection.config.blocks)
-        rows = selection.query["rows"]
-        preferred = ((2, 1), (1, 2)) if rows == 5 else ((1, 2), (2, 1))
-        value = 6 + (preferred.index(pair) if pair in preferred else 10)
-        return SimpleNamespace(value=value, rows=rows, pair=pair)
-
-    def benchmark(state):
-        return PreparedCall(
-            run=lambda: state.value,
-            output=state.value,
-            produce=lambda: None,
-            validate=lambda: validated.append((state.rows, state.pair)),
+    with session(tmp_path) as engine:
+        result = engine.prepare(
+            grid_declarations((17, 19), validated, limit=limit), coordinator=coordinate
         )
-
-    for cached in (False, True):
-        validated.clear()
-        items = tuple(
-            replace(
-                item,
-                benchmark_call=benchmark,
-                plan=replace(
-                    item.plan, _materialize=materialize, _benchmark_call=benchmark
-                ),
-            )
-            for item in launch_declarations((3, 5), parameters=("width", "blocks"))
-        )
-        with session(tmp_path) as engine:
-            result = engine.prepare(items, coordinator=coordinate)
-            assert result.benchmarked_candidates == (0 if cached else 8)
-            assert result.cache_hits == (2 if cached else 0)
-            assert result.selections["rows-5"].config == LaunchConfig(2, 1)
-            assert result.selections["rows-3"].config == LaunchConfig(1, 2)
-            assert len(engine._collective_buckets) == 1
-            choices = next(iter(engine._collective_buckets.values()))[1]
-            assert choices == ({"width": 2, "blocks": 1}, {"width": 1, "blocks": 2})
-            assert result.coverage["rows-3"]["bucket_pruned_count"] == 4
-            assert validated == (
-                []
-                if cached
-                else [(5, (width, blocks)) for width in (1, 2, 4) for blocks in (1, 2)]
-                + [(3, (1, 2)), (3, (2, 1))]
-            )
+    assert result.benchmarked_candidates == 6
+    assert result.coverage["rows-17"]["measured_count"] == 0
+    assert (
+        result.selections["rows-17"].config
+        == result.selections["rows-19"].config
+        == LaunchConfig(2, 2)
+    )
+    assert [(pair, producer) for row, pair, producer in validated if row == 17] == [
+        ((2, 2), 1),
+        ((2, 2), 2),
+    ]
 
 
-@pytest.mark.parametrize(
-    "parameters,count,buckets",
-    [
-        (("width",), 13, 1),
-        (("width", "blocks"), 15, 2),
-    ],
-)
-def test_bucket_compatibility_uses_only_eligible_projected_parameters(
-    tmp_path, host_races, parameters, count, buckets
+def test_grid_separates_shapes_with_different_eligible_assignments(
+    tmp_path, host_races
 ):
-    items = launch_declarations(
-        (3, 5),
-        parameters=parameters,
-        blocks=lambda query: (1, 2) if query.rows == 3 else (1, 2, 3),
+    first, second = grid_declarations((17, 19), [])
+    tuning = first.plan.contract
+    original_parameters = tuning.parameters
+
+    def parameters(query, device):
+        space = original_parameters(query, device)
+        return replace(
+            space, predicates=(lambda assignment: assignment["blocks"] == 1,)
+        )
+
+    first = replace(
+        first, plan=replace(first.plan, contract=replace(tuning, parameters=parameters))
     )
     with session(tmp_path) as engine:
-        result = engine.prepare(items, coordinator=coordinate)
-        assert result.benchmarked_candidates == count
-        assert len(engine._collective_buckets) == buckets
+        result = engine.prepare((first, second), coordinator=coordinate)
+    assert result.coverage["rows-17"]["measured_count"] == 3
+    assert result.coverage["rows-19"]["measured_count"] == 6
+    assert result.selections["rows-17"].config == LaunchConfig(1, 1)
+    assert result.selections["rows-19"].config == LaunchConfig(2, 2)
 
 
 @pytest.mark.parametrize(
@@ -330,67 +161,39 @@ def test_bucket_compatibility_uses_only_eligible_projected_parameters(
     [
         (None, "nonempty"),
         ([], "nonempty"),
-        ([{"width": 2}, {"width": 1}, {"width": 4}], "within the limit"),
-        ([{"width": 2}, {"width": 2}], "unique"),
-        ([{"width": 2}, {"width": 8}], "eligible projections"),
-        ([{"width": 2, "blocks": 1}], "projection parameters"),
-        ([{"width": 1}], "outside its calibrated choices"),
+        ([{"width": width, "blocks": 1} for width in (1, 2, 4)], "within the limit"),
+        ([{"width": 1, "blocks": 1}, {"width": 1, "blocks": 1}], "unique"),
+        (
+            [{"width": 1, "blocks": 1}, {"width": 1, "blocks": 4}],
+            "eligible assignments",
+        ),
+        ([{"width": 1}], "eligible assignments"),
+        ([{"width": 2, "blocks": 1}], "differs from its first choice"),
+        (
+            [{"width": 2, "blocks": 1}, {"width": 1, "blocks": 1}],
+            "differs from its first choice",
+        ),
     ],
 )
-def test_invalid_cached_shortlists_fail_before_calibration_is_published(
+def test_invalid_cached_grid_choices_fail_before_binding(
     tmp_path, host_races, choices, match
 ):
     import json
 
     with session(tmp_path) as engine:
-        engine.prepare(declarations((5,)), coordinator=coordinate)
+        engine.prepare(grid_declarations((16,), []), coordinator=coordinate)
         path = engine._cache.path
     payload = json.loads(path.read_text())
     record = next(iter(payload["records"].values()))
     record["coverage"]["bucket_choices"] = choices
     path.write_text(json.dumps(payload))
+    validated = []
+    (item,) = grid_declarations((16,), validated)
     with session(tmp_path) as engine:
         with pytest.raises(ValueError, match=match):
-            engine.prepare(declarations((5,)), coordinator=coordinate)
-        assert not engine._collective_buckets
-
-
-def test_pins_dependencies_and_small_catalogs_do_not_calibrate(tmp_path, host_races):
-    from .test_defaults import Config
-
-    for mode, count in (("pin", 0), ("dependency", 6), ("limit", 6)):
-        items = []
-        for item in declarations((3, 5)):
-            if mode == "pin":
-                item = replace(item, plan=replace(item.plan, override=Config(4)))
-            elif mode == "dependency":
-                item = replace(item, dependencies=("input",))
-            else:
-                callback = item.plan.contract.collective_bucket
-                tuning = replace(
-                    item.plan.contract,
-                    collective_bucket=lambda query, callback=callback: replace(
-                        callback(query), limit=3
-                    ),
-                )
-                item = replace(item, plan=replace(item.plan, contract=tuning))
-            items.append(item)
-        if mode == "dependency":
-            items.insert(
-                0,
-                request(
-                    name="input",
-                    tuning=replace(contract(values=(2,)), component_id="test.input"),
-                ),
-            )
-        with session(tmp_path / mode) as engine:
-            result = engine.prepare(items, coordinator=coordinate)
-            assert result.benchmarked_candidates == count, (mode, result.selections)
-            assert not engine._collective_buckets
-            if mode == "pin":
-                assert all(
-                    item.config.width == 4 for item in result.selections.values()
-                )
+            engine.prepare((item,), coordinator=coordinate)
+        assert item.plan.prepared is None
+    assert validated == []
 
 
 def test_plain_buckets_follow_bytes_and_preserve_collective_semantics():
@@ -413,14 +216,40 @@ def test_plain_buckets_follow_bytes_and_preserve_collective_semantics():
     first = _bucket(query((32, 5120)))
     assert first.identity == _bucket(query((36, 5120))).identity
     assert first.identity == _bucket(query((16, 10240))).identity
-    assert first.identity != _bucket(query((40, 5120))).identity
+    assert first.identity == _bucket(query((40, 5120))).identity
+    assert first.grid != _bucket(query((40, 5120))).grid
+    assert first.grid == _bucket(query((16, 10240))).grid
     assert first.identity != _bucket(query((32, 5120), inplace=True)).identity
     assert first.identity != _bucket(query((32, 5120), world_size=2)).identity
-    assert first.identity["upper_bytes"] == 48 * 8192
-    assert _bucket(query((160, 5120))).identity["upper_bytes"] == 256 * 8192
+    assert first.grid == CollectiveGrid(upper_bytes=320 * 1024, band=9)
+    assert _bucket(query((160, 5120))).grid == CollectiveGrid(
+        upper_bytes=1600 * 1024, band=10
+    )
+
+    def twoshot(transport):
+        native = dict(
+            surface="PCIeTwoShotBF16.all_reduce",
+            topology="pcie_ipc",
+            setup={},
+            call=dict(
+                dtype="bfloat16", shape=(4096,), row_elems=4096, transport=transport
+            ),
+        )
+        return _bucket(
+            SimpleNamespace(
+                operation="all_reduce",
+                world_size=4,
+                inplace=False,
+                alternatives={"twoshot": native},
+            )
+        )
+
+    assert twoshot("push").grid == twoshot("pull").grid
+    assert twoshot("push").identity != twoshot("pull").identity
 
 
-def test_tp4_twoshot_reuses_complete_interval_winner(tmp_path, host_races):
+@pytest.mark.parametrize("pairwise", (False, True), ids=("oneshot", "twoshot_pairwise"))
+def test_tp4_allreduce_reuses_complete_interval_winner(tmp_path, host_races, pairwise):
     from b12x.comm.pcie._collective_tuning import (
         CollectiveConfig,
         CollectiveQuery,
@@ -436,41 +265,62 @@ def test_tp4_twoshot_reuses_complete_interval_winner(tmp_path, host_races):
     validated = []
     items = []
     ranks = tuple(range(4))
-    for elements in (4160, 4168):
-        call = dict(
-            dtype="bfloat16",
-            shape=(elements,),
-            threads=128,
-            block_limit=8,
-            row_elems=4096,
-            transport="push",
-        )
-        native = dict(
-            surface="PCIeTwoShotBF16.all_reduce",
-            world_size=4,
-            rank=0,
-            topology="pcie_ipc",
-            setup={},
-        )
+    sizes = (4160, 4168) if pairwise else (264, 280, 288, 304)
+    preferred = CollectiveConfig(
+        implementation="twoshot_pairwise" if pairwise else "remote_push_full",
+        threads=128 if pairwise else 64,
+        blocks=8 if pairwise else 2,
+    )
+    for elements in sizes:
+        native = dict(world_size=4, rank=0, topology="pcie_ipc")
+        if pairwise:
+            native.update(surface="PCIeTwoShotBF16.all_reduce", setup={})
+            call = dict(
+                dtype="bfloat16",
+                shape=(elements,),
+                threads=128,
+                block_limit=8,
+                row_elems=4096,
+                transport="push",
+            )
+            alternatives = {
+                "twoshot": dict(native, call=call),
+                "twoshot_pairwise": dict(
+                    native, call=dict(call, payload_schedule="pairwise")
+                ),
+            }
+            default = "twoshot"
+        else:
+            native.update(
+                surface="OneshotAllReduce.all_reduce", setup={"shape": (elements,)}
+            )
+            alternatives = {
+                name: dict(
+                    native,
+                    call=dict(
+                        transport=name,
+                        dtype="bfloat16",
+                        stage_input=True,
+                        size_packs=elements // 8,
+                        threads=128,
+                        blocks=8,
+                    ),
+                )
+                for name in ("pull", "remote_push_full")
+            }
+            default = "pull"
         query = CollectiveQuery(
             operation="all_reduce",
             world_size=4,
             rank=0,
-            alternatives=FrozenMapping(
-                {
-                    "twoshot": dict(native, call=call),
-                    "twoshot_pairwise": dict(
-                        native, call=dict(call, payload_schedule="pairwise")
-                    ),
-                }
-            ),
-            default=CollectiveConfig(implementation="twoshot", threads=128, blocks=8),
+            alternatives=FrozenMapping(alternatives),
+            default=CollectiveConfig(implementation=default, threads=128, blocks=8),
         )
 
         def benchmark(state, elements=elements):
             return PreparedCall(
                 run=lambda: None,
-                output=6 if state.implementation == "twoshot_pairwise" else 7,
+                output=6 if state == preferred else 7,
                 produce=lambda: None,
                 validate=lambda: validated.append((elements, state)),
             )
@@ -497,12 +347,17 @@ def test_tp4_twoshot_reuses_complete_interval_winner(tmp_path, host_races):
             None, DeviceIdentity("nvidia", (12, 0), 148, "test SM120")
         )
         result = engine.prepare(items, coordinator=coordinate)
-        winner = result.selections["4168"].config
-        assert winner.implementation == "twoshot_pairwise"
-        assert result.coverage["4168"]["measured_count"] > 0
-        assert result.coverage["4160"]["measured_count"] == 0
-        assert result.selections["4160"].config == winner
-        assert [config for size, config in validated if size == 4160] == [winner]
+        follower = 4160 if pairwise else 280
+        representative = 4168 if pairwise else 288
+        assert result.selections[str(representative)].config == preferred
+        assert result.coverage[str(representative)]["measured_count"] > 0
+        assert result.coverage[str(follower)]["measured_count"] == 0
+        assert result.selections[str(follower)].config == preferred
+        assert [config for size, config in validated if size == follower] == [preferred]
+        if not pairwise:
+            lower = result.coverage["264"]["measured_count"]
+            upper = result.coverage["304"]["measured_count"]
+            assert 0 < result.coverage["288"]["measured_count"] < lower == upper
 
 
 def test_finalist_policy_preserves_full_families_and_cached_candidate_indices(
@@ -511,19 +366,18 @@ def test_finalist_policy_preserves_full_families_and_cached_candidate_indices(
     from b12x.preparation import FinalistPolicy
 
     items = tuple(
-        replace(item, finalist_policy=FinalistPolicy(family_fields=("width",)))
-        for item in declarations((3, 5))
+        replace(item, finalist_policy=FinalistPolicy(family_fields=("width", "blocks")))
+        for item in grid_declarations((17, 19), [])
     )
     original = None
     for cached in (False, True):
         with session(tmp_path) as engine:
             result = engine.prepare(items, coordinator=coordinate)
-            assert result.benchmarked_candidates == (0 if cached else 6)
+            assert result.benchmarked_candidates == (0 if cached else 12)
             assert result.cache_hits == (2 if cached else 0)
-            assert not engine._collective_buckets
             for name, finalists in result.finalists.items():
                 assert {item.selection.config.width for item in finalists} == {1, 2, 4}
-                assert {item.candidate_index for item in finalists} == {0, 1, 2}
+                assert {item.candidate_index for item in finalists} == set(range(6))
                 assert "bucket_choices" not in result.coverage[name]
             if cached:
                 assert result.finalists == {
@@ -539,8 +393,33 @@ def test_finalist_policy_preserves_full_families_and_cached_candidate_indices(
                 original = result.finalists
 
 
-def grid_declarations(rows, validated, *, failing=None):
-    items = []
+def grid_declarations(rows, validated, *, failing=None, limit=2):
+    from b12x.preparation._efficiency import capture_autotune_effort
+
+    knobs = (Knob(name="width", values=(1, 2, 4)), Knob(name="blocks", values=(1, 2)))
+    tuning = replace(
+        contract(),
+        config_fields=frozenset(("width", "blocks")),
+        encode_config=asdict,
+        decode_config=lambda payload: LaunchConfig(**payload),
+        validate_config=lambda query, config, device: None,
+        default_config=lambda query, device: LaunchConfig(2, 1),
+        knobs=knobs,
+        parameters=lambda query, device: ParameterSpace(
+            knobs=knobs, autotune_effort=capture_autotune_effort()
+        ),
+        materialize=lambda query, device, assignment: LaunchConfig(**assignment),
+        collective_signature=lambda query: query.rows,
+        collective_bucket=lambda query: CollectiveBucket(
+            identity={"operation": "arithmetic"},
+            size_bytes=query.rows,
+            limit=limit,
+            grid=CollectiveGrid(
+                upper_bytes=-(-query.rows // 4) * 4,
+                band=(query.rows.bit_length() - 1) // 2,
+            ),
+        ),
+    )
 
     def materialize(selection, device):
         row = selection.query["rows"]
@@ -568,27 +447,20 @@ def grid_declarations(rows, validated, *, failing=None):
             validate=validate,
         )
 
-    for item in launch_declarations(rows, parameters=("width", "blocks")):
-        tuning = replace(
-            item.plan.contract,
-            collective_bucket=lambda query: CollectiveBucket(
-                identity={"operation": "arithmetic"},
-                parameters=("width", "blocks"),
-                size_bytes=query.rows,
-                limit=2,
-                grid=CollectiveGrid(
-                    upper_bytes=-(-query.rows // 4) * 4,
-                    band=(query.rows.bit_length() - 1) // 2,
-                ),
-            ),
+    items = []
+    for row in rows:
+        item = request(
+            name=f"rows-{row}",
+            tuning=tuning,
+            benchmark=benchmark,
+            collective=CollectiveRequirement(f"group/{row}", (0, 1)),
         )
         items.append(
             replace(
                 item,
-                benchmark_call=benchmark,
                 plan=replace(
                     item.plan,
-                    contract=tuning,
+                    query=Query(row),
                     _materialize=materialize,
                     _benchmark_call=benchmark,
                 ),
@@ -660,26 +532,6 @@ def test_grid_calibrates_anchors_and_reuses_validated_interval_winners(
 def test_grid_rejects_invalid_intervals(changes):
     with pytest.raises(ValueError):
         CollectiveGrid(**({"upper_bytes": 32, "band": 2} | changes))
-
-
-def test_grid_rejects_partial_parameter_projections(tmp_path, host_races):
-    items = grid_declarations((16, 24), [])
-    callback = items[0].plan.contract.collective_bucket
-    first = replace(
-        items[0],
-        plan=replace(
-            items[0].plan,
-            contract=replace(
-                items[0].plan.contract,
-                collective_bucket=lambda query: replace(
-                    callback(query), parameters=("width",)
-                ),
-            ),
-        ),
-    )
-    with session(tmp_path, prime=False) as engine:
-        with pytest.raises(ValueError, match="every assignment parameter"):
-            engine.prepare((first, items[1]), coordinator=coordinate)
 
 
 def test_grid_validation_failure_does_not_cache_the_follower(tmp_path, host_races):

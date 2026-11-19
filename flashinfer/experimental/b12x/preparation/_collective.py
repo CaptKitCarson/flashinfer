@@ -75,10 +75,6 @@ class _Cancelled(Exception):
     pass
 
 
-def _projection(assignment, parameters):
-    return FrozenMapping({name: assignment[name] for name in parameters})
-
-
 def tuning_bucket(obligation):
     request = obligation.request
     contract = request.plan.contract
@@ -106,24 +102,9 @@ def tuning_bucket(obligation):
         return None
     if not isinstance(bucket, CollectiveBucket):
         raise TypeError("collective_bucket must return a CollectiveBucket or None")
-    parameters = {knob.name for knob in space.knobs}
-    if set(bucket.parameters) - parameters:
-        raise ValueError(
-            "collective bucket parameters are absent from its parameter space"
-        )
-    if bucket.grid is not None and set(bucket.parameters) != parameters:
-        raise ValueError("collective grids require every assignment parameter")
-    projections = tuple(
-        sorted(
-            {
-                _projection(assignment, bucket.parameters)
-                for assignment, _ in obligation.candidates
-            },
-            key=digest,
-        )
+    eligible = tuple(
+        sorted((assignment for assignment, _ in obligation.candidates), key=digest)
     )
-    if len(projections) <= bucket.limit:
-        return None
     return replace(
         bucket,
         identity=FrozenMapping(
@@ -137,9 +118,9 @@ def tuning_bucket(obligation):
                 ),
                 invocation=request.plan.invocation.to_dict(),
                 bucket=bucket.identity,
-                parameters=bucket.parameters,
+                parameters=tuple(knob.name for knob in contract.knobs),
                 limit=bucket.limit,
-                eligible=projections,
+                eligible=eligible,
             )
         ),
     )
@@ -147,7 +128,6 @@ def tuning_bucket(obligation):
 
 def calibration_order(obligations):
     """Order full calibrations, refined intervals, and exact-query validation."""
-    representatives = {}
     grids = {}
     for index, obligation in enumerate(obligations):
         if obligation.selection is not None and not obligation.ready:
@@ -163,12 +143,7 @@ def calibration_order(obligations):
                 )
             )
         )
-        if bucket.grid is not None:
-            grids.setdefault(key, []).append((index, obligation, bucket))
-            continue
-        previous = representatives.get(key)
-        if previous is None or bucket.size_bytes > previous[0]:
-            representatives[key] = (bucket.size_bytes, index)
+        grids.setdefault(key, []).append((index, obligation, bucket))
 
     ordered = {"full": [], "refined": [], "reused": []}
     grid_indices = set()
@@ -215,7 +190,6 @@ def calibration_order(obligations):
                     ordered["reused"].append(
                         (family, member_bucket.size_bytes, obligation)
                     )
-    first = {index for _, index in representatives.values()}
     result = [
         item
         for role in ("full", "refined", "reused")
@@ -224,11 +198,8 @@ def calibration_order(obligations):
             key=lambda entry: (entry[0], entry[1], entry[2].request.collective.key),
         )
     ]
-    result.extend(item for index, item in enumerate(obligations) if index in first)
     result.extend(
-        item
-        for index, item in enumerate(obligations)
-        if index not in first and index not in grid_indices
+        item for index, item in enumerate(obligations) if index not in grid_indices
     )
     return result
 
@@ -263,29 +234,23 @@ def _load(job, obligation, record):
     return job._selection(obligation, config, "cached", assignment)
 
 
-def _bucket_choices(bucket, choices, assignment):
+def _validate_bucket_choices(bucket, choices, assignment, parent_choices):
     if not isinstance(choices, (tuple, list)) or not 0 < len(choices) <= bucket.limit:
         raise ValueError(
             "collective bucket choices must be nonempty and within the limit"
         )
-    eligible = set(bucket.identity["eligible"])
-    selected = []
-    for choice in choices:
-        if not isinstance(choice, Mapping) or set(choice) != set(bucket.parameters):
-            raise ValueError(
-                "collective bucket choice has different projection parameters"
-            )
-        projection = FrozenMapping(choice)
-        if projection not in eligible:
-            raise ValueError(
-                "collective bucket choice is outside its eligible projections"
-            )
-        if projection in selected:
-            raise ValueError("collective bucket choices must be unique")
-        selected.append(projection)
-    if _projection(assignment, bucket.parameters) not in selected:
-        raise ValueError("collective selection is outside its calibrated choices")
-    return tuple(choice.to_dict() for choice in selected)
+    if any(not isinstance(choice, Mapping) for choice in choices):
+        raise ValueError("collective bucket choices must be complete assignments")
+    choices = tuple(FrozenMapping(choice) for choice in choices)
+    unique = set(choices)
+    if not unique.issubset(bucket.identity["eligible"]):
+        raise ValueError("collective bucket choice is outside its eligible assignments")
+    if len(unique) != len(choices):
+        raise ValueError("collective bucket choices must be unique")
+    if choices[0] != FrozenMapping(assignment):
+        raise ValueError("cached collective grid winner differs from its first choice")
+    if parent_choices is not None and not unique.issubset(parent_choices):
+        raise ValueError("cached collective choices differ from its grid parents")
 
 
 def select(job, obligation, selections):
@@ -296,22 +261,16 @@ def select(job, obligation, selections):
             "collective tuning requires a group-consistent query signature"
         )
     bucket = tuning_bucket(obligation)
-    bucket_payload = (
-        None
-        if bucket is None
-        else dict(
+    bucket_payload = None
+    grid = None
+    if bucket is not None:
+        grid = obligation.collective_calibration or _CollectiveCalibration("full")
+        bucket_payload = dict(
             identity=bucket.identity.to_dict(),
             size_bytes=bucket.size_bytes,
-            parameters=bucket.parameters,
+            parameters=bucket.identity["parameters"],
             limit=bucket.limit,
-        )
-    )
-    grid = obligation.collective_calibration
-    if bucket is not None and bucket.grid is not None:
-        if grid is None:
-            grid = _CollectiveCalibration("full")
-        bucket_payload["grid"] = dict(
-            upper_bytes=bucket.grid.upper_bytes, band=bucket.grid.band
+            grid=dict(upper_bytes=bucket.grid.upper_bytes, band=bucket.grid.band),
         )
     grid_payload = (
         None
@@ -359,19 +318,6 @@ def select(job, obligation, selections):
         _same(peers, field)
     if any(peer["cancel"] for peer in peers):
         return job._selection(obligation, obligation.configuration.default, "default")
-    bucket_key = None
-    calibration = None
-    if bucket is not None and grid is None:
-        bucket_key = digest(
-            FrozenMapping(
-                dict(
-                    identity=bucket.identity,
-                    devices=tuple(peer["device"] for peer in peers),
-                    ranks=requirement.ranks,
-                )
-            )
-        )
-        calibration = job.session._collective_buckets.get(bucket_key)
     grid_parents = ()
     grid_choices = None
     if grid is not None:
@@ -384,13 +330,11 @@ def select(job, obligation, selections):
             for key, choices in _parent_records(grid)
         )
         if grid.role == "refined":
-            grid_choices = tuple(
-                dict.fromkeys(
-                    FrozenMapping(choice)
-                    for _, choices in grid_parents
-                    for choice in choices
-                )
-            )
+            grid_choices = {
+                FrozenMapping(choice)
+                for _, choices in grid_parents
+                for choice in choices
+            }
         elif grid.role == "reused":
             grid_choices = (FrozenMapping(grid_parents[0][1][0]),)
     cache_identity = {
@@ -406,123 +350,74 @@ def select(job, obligation, selections):
     }
     if bucket is not None:
         cache_identity["collective_bucket"] = (2, bucket_payload)
+        # Version 2 bucket keys reserve this field.
         cache_identity["bucket_calibration"] = None
-    if grid is not None:
         cache_identity["collective_grid"] = (1, grid.role, grid_parents)
     obligation.key = digest(cache_identity)
-    if calibration is not None and obligation.key != calibration[0]:
-        obligation.key = digest({**cache_identity, "bucket_calibration": calibration})
     cache = job.session._selection_cache()
     peers = yield from exchange(
         requirement,
         "cache",
         record=cache.get(obligation.key),
-        calibration=calibration,
         grid_parents=grid_parents,
     )
-    _same(peers, "calibration")
     _same(peers, "grid_parents")
     record = next(
         (peer["record"] for peer in peers if peer["record"] is not None), None
     )
     if record is not None and (policy is None or record.get("finalists")):
         if bucket is not None:
-            choices = _bucket_choices(
-                bucket, record["coverage"].get("bucket_choices"), record["assignment"]
+            _validate_bucket_choices(
+                bucket,
+                record["coverage"].get("bucket_choices"),
+                record["assignment"],
+                grid_choices,
             )
-            if calibration is not None and choices != calibration[1]:
-                raise ValueError(
-                    "cached collective choices differ from its calibration"
-                )
-            if grid is not None and FrozenMapping(choices[0]) != FrozenMapping(
-                record["assignment"]
-            ):
-                raise ValueError(
-                    "cached collective grid winner differs from its first choice"
-                )
-            if grid_choices is not None and any(
-                FrozenMapping(choice) not in grid_choices for choice in choices
-            ):
-                raise ValueError(
-                    "cached collective choices differ from its grid parents"
-                )
         selection = _load(job, obligation, record)
-        if grid is not None:
-            obligation.collective_record = _CollectiveCalibrationRecord(
-                bucket,
-                requirement.ranks,
-                obligation.key,
-                FrozenMapping(obligation.coverage),
-                grid.role,
-                _parent_records(grid),
+    else:
+        if job.session.cache_only:
+            raise LookupError(
+                f"no completed collective selection for {obligation.request.name}"
             )
-        if bucket_key is not None and calibration is None:
-            job.session._collective_buckets[bucket_key] = (obligation.key, choices)
-        return selection
-    if job.session.cache_only:
-        raise LookupError(
-            f"no completed collective selection for {obligation.request.name}"
-        )
-    if obligation.request.benchmark_call is None:
-        raise ValueError("collective tuning requires a representative benchmark call")
-    if grid_choices is not None and grid.role == "reused":
+        if obligation.request.benchmark_call is None:
+            raise ValueError(
+                "collective tuning requires a representative benchmark call"
+            )
+        if grid is not None and grid.role == "refined":
+            before = len(obligation.candidates)
+            obligation.candidates = [
+                (assignment, config)
+                for assignment, config in obligation.candidates
+                if assignment in grid_choices
+            ]
+            if not obligation.candidates:
+                raise ValueError(
+                    "collective bucket choices have no eligible configurations"
+                )
+            obligation.coverage["bucket_pruned_count"] = before - len(
+                obligation.candidates
+            )
         try:
-            selection = yield from _reuse_calibration(job, obligation, grid_choices[0])
-            obligation.collective_record = _CollectiveCalibrationRecord(
-                bucket,
-                requirement.ranks,
-                obligation.key,
-                FrozenMapping(obligation.coverage),
-                grid.role,
-                _parent_records(grid),
-            )
-            return selection
+            if grid is not None and grid.role == "reused":
+                selection = yield from _reuse_calibration(
+                    job, obligation, grid_choices[0]
+                )
+            else:
+                selection = yield from race(job, obligation, bucket=bucket)
         except _Cancelled:
             return job._selection(
                 obligation, obligation.configuration.default, "default"
             )
-    if calibration is not None or grid_choices is not None:
-        choices = (
-            set(grid_choices)
-            if grid_choices is not None
-            else {FrozenMapping(choice) for choice in calibration[1]}
+    if grid is not None:
+        obligation.collective_record = _CollectiveCalibrationRecord(
+            bucket,
+            requirement.ranks,
+            obligation.key,
+            FrozenMapping(obligation.coverage),
+            grid.role,
+            _parent_records(grid),
         )
-        before = len(obligation.candidates)
-        obligation.candidates = [
-            (assignment, config)
-            for assignment, config in obligation.candidates
-            if _projection(assignment, bucket.parameters) in choices
-        ]
-        if not obligation.candidates:
-            raise ValueError(
-                "collective bucket choices have no eligible configurations"
-            )
-        obligation.coverage["bucket_pruned_count"] = before - len(obligation.candidates)
-        if calibration is not None:
-            obligation.coverage["bucket_choices"] = calibration[1]
-    try:
-        selection = yield from race(
-            job,
-            obligation,
-            bucket=bucket if calibration is None else None,
-        )
-        if grid is not None:
-            obligation.collective_record = _CollectiveCalibrationRecord(
-                bucket,
-                requirement.ranks,
-                obligation.key,
-                FrozenMapping(obligation.coverage),
-                grid.role,
-                _parent_records(grid),
-            )
-        if bucket_key is not None and calibration is None:
-            job.session._collective_buckets[bucket_key] = (
-                obligation.key,
-                tuple(obligation.coverage["bucket_choices"]),
-            )
-        return selection
-    except _Cancelled:
-        return job._selection(obligation, obligation.configuration.default, "default")
+    return selection
 
 
 def _prepare_trial(
@@ -839,19 +734,17 @@ def race(job, obligation, *, bucket=None):
         _same(peers, "assignment")
         obligation.coverage["measured_count"] = len(measurements)
         if bucket is not None:
-            best = {}
-            for index, latency in measurements.items():
-                projection = _projection(
-                    obligation.candidates[index][0], bucket.parameters
-                )
-                best[projection] = min(best.get(projection, math.inf), latency)
-            winner = _projection(champion.assignment, bucket.parameters)
-            choices = sorted(
-                best,
-                key=lambda choice: (choice != winner, best[choice], digest(choice)),
+            ranked = sorted(
+                measurements,
+                key=lambda index: (
+                    index != champion.index,
+                    measurements[index],
+                    digest(obligation.candidates[index][0]),
+                ),
             )
             obligation.coverage["bucket_choices"] = tuple(
-                choice.to_dict() for choice in choices[: bucket.limit]
+                obligation.candidates[index][0].to_dict()
+                for index in ranked[: bucket.limit]
             )
         obligation.cache_pending = True
         if obligation.key is not None:

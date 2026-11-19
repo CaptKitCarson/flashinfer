@@ -480,7 +480,6 @@ def _grid_bucket(size, identity):
     return CollectiveBucket(
         identity=identity,
         size_bytes=size,
-        parameters=tuple(knob.name for knob in TUNING.knobs),
         limit=8,
         grid=CollectiveGrid(
             upper_bytes=-(-size // step) * step,
@@ -568,27 +567,12 @@ def _bucket(query):
         inplace=query.inplace,
         alternatives=alternatives,
     )
-    if "twoshot_pairwise" in alternatives:
-        twoshot = query.alternatives["twoshot_pairwise"]
-        return _grid_bucket(
-            size,
-            dict(version=2, **identity, row_elems=twoshot["call"]["row_elems"]),
-        )
-    units = -(-size // 8192)
-    ladder = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)
-    upper = next((value for value in ladder if value >= units), None)
-    if upper is None:
-        upper = 1 << (units - 1).bit_length()
-    return CollectiveBucket(
-        identity=dict(
-            version=1,
-            **identity,
-            upper_bytes=upper * 8192,
-        ),
-        size_bytes=size,
-        parameters=("implementation",),
-        limit=2,
-    )
+    if "twoshot" in alternatives:
+        call = query.alternatives["twoshot"]["call"]
+        identity["row_elems"] = call["row_elems"]
+        if call["transport"] == "pull":
+            identity["twoshot_transport"] = "pull"
+    return _grid_bucket(size, dict(version=2, **identity))
 
 
 TUNING = TuningContract(

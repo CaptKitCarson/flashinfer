@@ -242,17 +242,12 @@ class CollectiveGrid:
 
 @dataclass(frozen=True, kw_only=True)
 class CollectiveBucket:
-    """Compatible collective queries sharing a measured parameter shortlist.
-
-    ``parameters`` identifies the assignment projection retained by calibration.
-    Parameters outside that projection remain independently tunable per query.
-    """
+    """Compatible collective queries sharing a complete interval-winning configuration."""
 
     identity: Mapping[str, object]
     size_bytes: int
-    parameters: tuple[str, ...]
     limit: int
-    grid: CollectiveGrid | None = None
+    grid: CollectiveGrid
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, Mapping) or not self.identity:
@@ -263,23 +258,10 @@ class CollectiveBucket:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"collective bucket {name} must be a positive integer")
-        if self.grid is not None:
-            if not isinstance(self.grid, CollectiveGrid):
-                raise TypeError("collective bucket grid must be a CollectiveGrid")
-            if self.size_bytes > self.grid.upper_bytes:
-                raise ValueError("collective payload exceeds its grid interval")
-        parameters = tuple(self.parameters)
-        if (
-            isinstance(self.parameters, str)
-            or not parameters
-            or any(
-                not isinstance(name, str) or not name.isidentifier()
-                for name in parameters
-            )
-            or len(parameters) != len(set(parameters))
-        ):
-            raise ValueError("collective bucket parameters must be unique identifiers")
-        object.__setattr__(self, "parameters", parameters)
+        if not isinstance(self.grid, CollectiveGrid):
+            raise TypeError("collective bucket grid must be a CollectiveGrid")
+        if self.size_bytes > self.grid.upper_bytes:
+            raise ValueError("collective payload exceeds its grid interval")
 
 
 @dataclass(frozen=True, kw_only=True)

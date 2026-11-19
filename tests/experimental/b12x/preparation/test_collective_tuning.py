@@ -143,7 +143,6 @@ def test_island_tunes_threads_and_participation_on_a_fixed_grid():
     assert {config.active_blocks for config in configs} == {1, 2, 4, 8, 16, 32, 64}
     bucket = _bucket(query)
     assert bucket.limit == 8
-    assert bucket.parameters == tuple(knob.name for knob in TUNING.knobs)
     with autotune_effort("off"):
         configs = [
             config for _, config in TUNING.iterate(TUNING.configure(query, device=None))

@@ -460,12 +460,7 @@ def test_tp4_plan_only_offers_pairwise_for_push(
     assert "pull" in plan.query.alternatives
     bucket = plan.contract.collective_bucket(plan.query)
     assert bucket.size_bytes == 512
-    if admitted:
-        assert bucket.parameters == tuple(knob.name for knob in plan.contract.knobs)
-        assert bucket.grid.upper_bytes == 512
-    else:
-        assert bucket.parameters == ("implementation",)
-        assert bucket.grid is None
+    assert bucket.grid.upper_bytes == 512
     assert set(bucket.identity["alternatives"]) == set(plan.query.alternatives)
     larger = manager.plan(torch.empty(512, dtype=torch.bfloat16))
     larger_bucket = larger.contract.collective_bucket(larger.query)
