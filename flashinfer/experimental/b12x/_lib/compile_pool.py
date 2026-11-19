@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import gc
 import importlib
 import multiprocessing
 import os
@@ -441,7 +440,6 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
     )
     del result
     evict_unretained(())
-    gc.collect()
     return completed
 
 

@@ -29,11 +29,15 @@ def test_repeated_worker_jobs_release_unretained_programs_and_preserve_artifacts
         compile_plan.evict_planning_artifacts()
         factory = compile_pool._factory(job.factory)
         references = []
+        collections = []
+        gc.disable()
+        gc.callbacks.append(lambda phase, info: collections.append((phase, info)))
 
         def observe_factory(*args, **kwargs):
             result = factory(*args, **kwargs)
-            references.extend(weakref.ref(compile_plan._RESIDENT_PROGRAMS[program])
-                              for program in compile_plan.program_keys(result))
+            for program in compile_plan.program_keys(result):
+                owner = compile_plan._RESIDENT_PROGRAMS[program]
+                references.extend((weakref.ref(owner), weakref.ref(owner._executable)))
             return result
 
         observed_job = replace(job, factory="__main__:observe_factory")
@@ -55,6 +59,7 @@ def test_repeated_worker_jobs_release_unretained_programs_and_preserve_artifacts
                 assert completed == (os.getpid(), 0, 0, description.programs)
                 assert all(owner() is None for owner in references)
             assert compiler.compile_cache_info()["compile_misses"] == before + first[1]
+            assert not collections, "compiler jobs forced collection of the worker heap"
 
             references.clear()
             with compile_plan.retain_compiled_programs() as retained:
