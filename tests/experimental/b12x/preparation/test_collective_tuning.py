@@ -1,6 +1,7 @@
 """Collective exchanges preserve identical candidate schedules across ranks."""
 
 from dataclasses import replace
+from math import prod
 
 import pytest
 
@@ -77,9 +78,18 @@ def test_dcp_candidates_coalesce_effective_grids_and_preserve_overrides():
     assert values[0][1] == query.default
 
 
-def _island_query(rank=0, *, threads=512, override=False, inplace=False):
+def _island_query(
+    rank=0,
+    *,
+    threads=512,
+    override=False,
+    inplace=False,
+    shape=(1024, 7168),
+    alignment=256,
+):
     from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery
-    from b12x.comm.pcie._island_rs_cute import island_rs_peers
+    from b12x.comm.pcie._island_copy import copy_scratch_bytes
+    from b12x.comm.pcie._island_rs_cute import HEADER_BYTES, island_rs_peers
 
     native = dict(
         surface="PCIeIslandRSAllReduce.all_reduce",
@@ -91,9 +101,20 @@ def _island_query(rank=0, *, threads=512, override=False, inplace=False):
             blocks=64,
             active_blocks=16,
             inplace=inplace,
-            inp=dict(shape=(1024, 7168), dtype="torch.bfloat16"),
+            inp=dict(
+                shape=shape,
+                stride=tuple(prod(shape[index + 1 :]) for index in range(len(shape))),
+                dtype="torch.bfloat16",
+                alignment=alignment,
+            ),
         ),
-        setup=dict(peer_ranks=island_rs_peers(rank, 16), threads_override=override),
+        setup=dict(
+            peer_ranks=island_rs_peers(rank, 16),
+            threads_override=override,
+            slab_bytes=HEADER_BYTES
+            + 72 * (1024 * 7168 // 8)
+            + copy_scratch_bytes(1024 * 7168 // 8),
+        ),
     )
     return CollectiveQuery(
         operation="all_reduce",
@@ -108,7 +129,7 @@ def _island_query(rank=0, *, threads=512, override=False, inplace=False):
 
 
 def test_island_tunes_threads_and_participation_on_a_fixed_grid():
-    from b12x.comm.pcie._collective_tuning import TUNING, _family_bucket
+    from b12x.comm.pcie._collective_tuning import TUNING, _bucket
     from b12x.preparation import autotune_effort
 
     query = _island_query()
@@ -120,12 +141,93 @@ def test_island_tunes_threads_and_participation_on_a_fixed_grid():
     assert {config.submode for config in configs} == {""}
     assert {config.blocks for config in configs} == {64}
     assert {config.active_blocks for config in configs} == {1, 2, 4, 8, 16, 32, 64}
-    assert _family_bucket(query) is None
+    bucket = _bucket(query)
+    assert bucket.limit == 8
+    assert bucket.parameters == tuple(knob.name for knob in TUNING.knobs)
     with autotune_effort("off"):
         configs = [
             config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
         ]
     assert configs == [query.default]
+
+
+def test_island_buckets_share_bytes_across_contiguous_shapes_and_ranks():
+    from b12x.comm.pcie._collective_tuning import _bucket
+
+    first = _bucket(_island_query(shape=(1024, 7168)))
+    assert first.identity == _bucket(_island_query(shape=(2048, 3584))).identity
+    assert first.identity == _bucket(_island_query(rank=9)).identity
+    assert first.identity == _bucket(_island_query(shape=(896, 7168))).identity
+    assert first.identity == _bucket(_island_query(shape=(768, 7168))).identity
+    assert first.grid != _bucket(_island_query(shape=(896, 7168))).grid
+    assert first.grid == _bucket(_island_query(shape=(2048, 3584))).grid
+    assert first.size_bytes == 14 << 20
+    assert first.grid.upper_bytes == 14 << 20
+    assert first.grid.band == 11
+    small = _bucket(_island_query(shape=(39, 7168)))
+    assert small.grid == _bucket(_island_query(shape=(40, 7168))).grid
+    assert small.grid != _bucket(_island_query(shape=(44, 7168))).grid
+    assert first.identity != _bucket(_island_query(inplace=True)).identity
+    assert first.identity != _bucket(_island_query(alignment=128)).identity
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    (
+        ("call", "blocks", 32),
+        ("call", "wait_nanosleep_cycles", 8),
+        (
+            "call",
+            "output",
+            {
+                "shape": (1024, 7168),
+                "stride": (7168, 1),
+                "dtype": "torch.bfloat16",
+                "alignment": 256,
+            },
+        ),
+        ("setup", "max_elements", 8388608),
+        ("setup", "quarter_capacity", 1048576),
+        ("setup", "slab_bytes", 104857600),
+        ("setup", "stage_offset", 262144),
+        ("setup", "part_offset", 524288),
+        ("setup", "final_offset", 1048576),
+        ("setup", "active_blocks_override", True),
+    ),
+)
+def test_island_buckets_preserve_storage_and_launch_contract(section, field, value):
+    from b12x.comm.pcie._collective_tuning import _bucket
+
+    query = _island_query()
+    payload = query.alternatives["island_rs"].to_dict()
+    payload[section][field] = value
+    changed = replace(query, alternatives=FrozenMapping({"island_rs": payload}))
+    assert _bucket(query).identity != _bucket(changed).identity
+
+
+def test_island_bucket_ignores_only_unpinned_participation_default():
+    from b12x.comm.pcie._collective_tuning import _bucket
+
+    query = _island_query()
+    payload = query.alternatives["island_rs"].to_dict()
+    payload["call"]["active_blocks"] = 8
+    changed = replace(query, alternatives=FrozenMapping({"island_rs": payload}))
+    assert _bucket(query).identity == _bucket(changed).identity
+    payload["setup"]["active_blocks_override"] = True
+    pinned = replace(query, alternatives=FrozenMapping({"island_rs": payload}))
+    payload["call"]["active_blocks"] = 16
+    other = replace(query, alternatives=FrozenMapping({"island_rs": payload}))
+    assert _bucket(pinned).identity != _bucket(other).identity
+
+
+def test_island_bucket_does_not_flatten_strided_inputs():
+    from b12x.comm.pcie._collective_tuning import _bucket
+
+    query = _island_query()
+    payload = query.alternatives["island_rs"].to_dict()
+    payload["call"]["inp"]["stride"] = (7169, 1)
+    changed = replace(query, alternatives=FrozenMapping({"island_rs": payload}))
+    assert _bucket(changed) is None
 
 
 def test_island_explicit_thread_setting_remains_fixed():
@@ -717,7 +819,9 @@ def test_collective_catalog_rejects_rank_divergent_finalist_policy():
         ),
     )
     obligation = SimpleNamespace(
-        request=req, candidates=((FrozenMapping({"width": 1}), Config(1)),)
+        request=req,
+        candidates=((FrozenMapping({"width": 1}), Config(1)),),
+        collective_calibration=None,
     )
     steps = select(job, obligation, {})
     local = next(steps)

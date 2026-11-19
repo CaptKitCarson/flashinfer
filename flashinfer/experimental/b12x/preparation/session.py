@@ -24,6 +24,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from functools import cached_property, lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from filelock import Timeout
 
@@ -74,6 +75,10 @@ from .types import (
     call_scope,
 )
 
+if TYPE_CHECKING:
+    from ._collective import _CollectiveCalibration, _CollectiveCalibrationRecord
+
+
 logger = logging.getLogger("b12x.preparation")
 
 
@@ -103,6 +108,8 @@ class _Obligation:
     jobs: dict = field(default_factory=dict)
     compile_assignments: dict = field(default_factory=dict)
     cache_pending: bool = False
+    collective_calibration: _CollectiveCalibration | None = None
+    collective_record: _CollectiveCalibrationRecord | None = None
     ready: bool = False
     planned_candidates: int = 0
     discovery: _Discovery | None = None
@@ -347,8 +354,21 @@ def _expand_requests(requests):
 
 def _coalesce_requests(requests):
     """Group declaration-equivalent work while preserving its runtime bindings."""
-    groups, keys, policies = {}, {}, {}
+    groups, keys, policies, ranks_by_plan = {}, {}, {}, {}
     for request in requests:
+        ranks = None if request.collective is None else request.collective.ranks
+        if request.plan in ranks_by_plan and ranks_by_plan[request.plan] != ranks:
+            raise ValueError(
+                "requests for the same Plan must agree on collective ranks"
+            )
+        ranks_by_plan[request.plan] = ranks
+        prepared = request.plan.prepared
+        if prepared is not None and prepared.collective_tuning is not None:
+            if ranks != prepared.collective_tuning.ranks:
+                raise ValueError(
+                    f"retained collective {request.name} cannot use ranks {ranks}; "
+                    f"prepared ranks are {prepared.collective_tuning.ranks}"
+                )
         if (
             request.plan in policies
             and policies[request.plan] != request.finalist_policy
@@ -358,7 +378,7 @@ def _coalesce_requests(requests):
         key = (
             _declaration_key(request.plan),
             tuple(dict.fromkeys(keys[name] for name in request.dependencies)),
-            None if request.collective is None else request.collective.ranks,
+            ranks,
             request.finalist_policy,
         )
         keys[request.name] = key
@@ -488,7 +508,7 @@ class PreparationSession:
         self._tuning_rank = 0
         self._tuning_ranks = (0,)
         self._tuning_cache_synchronized = False
-        self._collective_family_buckets = {}
+        self._collective_buckets = {}
         self.session_id = uuid.uuid4().hex
         self.state = "OPEN"
 
@@ -1868,6 +1888,12 @@ class PreparationJob:
                         )
                     if obligation.selection is None:
                         obligation.coverage = dict(coverage)
+            if obligation.ready:
+                record = plan.prepared.collective_tuning
+                if record is not None:
+                    obligation.collective_record = record
+                    obligation.key = record.key
+                    obligation.coverage = record.coverage.to_dict()
             for item in obligation.memory_requests:
                 if (
                     item.plan.prepared is not None
@@ -3075,6 +3101,8 @@ class PreparationJob:
                         guard.restore()
                         del call, guard
                         yield "gpu"
+            if obligation.collective_record is not None:
+                item_plan.prepared.collective_tuning = obligation.collective_record
             selection = item_plan.selection
             expected = item_plan.prepared.programs | dependencies
             selections[item.name] = (selection, item_plan.contract)
@@ -3311,6 +3339,9 @@ class PreparationJob:
             self._total_rounds = 0
             self._latest_round_us = ()
             if obligation.ready:
+                from ._collective import validate_retained_calibration
+
+                validate_retained_calibration(obligation)
                 selection = obligation.selection
                 programs = plan.prepared.programs
                 obligation.programs[plan.contract.config_payload(selection.config)] = (

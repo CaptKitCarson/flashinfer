@@ -8,6 +8,8 @@ from .context import ContextCandidate, ContextRaceResult
 from ._progress import PreparationDisplay
 from .tuning import (
     BackendConfig,
+    CollectiveBucket,
+    CollectiveGrid,
     EligiblePlan,
     Knob,
     ParameterBinding,
@@ -49,6 +51,8 @@ __all__ = [
     "BackendConfig",
     "CandidateResourceIneligibleError",
     "CollectiveBarrierTimeout",
+    "CollectiveBucket",
+    "CollectiveGrid",
     "CollectiveRequirement",
     "CollectiveTuningRequirement",
     "DetectedDevice",

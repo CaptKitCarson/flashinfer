@@ -455,7 +455,7 @@ def test_tp4_plan_only_offers_pairwise_for_push(
     assert ("twoshot_pairwise" in plan.query.alternatives) == admitted
     assert "twoshot" in plan.query.alternatives
     assert "pull" in plan.query.alternatives
-    assert (_collective_tuning._family_bucket(plan.query) is None) == admitted
+    assert (plan.contract.collective_bucket(plan.query) is None) == admitted
     expected = "twoshot" if prefer_twoshot else "pull"
     assert plan.query.default.implementation == expected
     with autotune_effort("default"):

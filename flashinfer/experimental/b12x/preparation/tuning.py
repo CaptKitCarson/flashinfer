@@ -227,6 +227,62 @@ class TuningConfiguration(Generic[QueryT, ConfigT]):
 
 
 @dataclass(frozen=True, kw_only=True)
+class CollectiveGrid:
+    """A payload interval and the coarse size band containing its representative."""
+
+    upper_bytes: int
+    band: int
+
+    def __post_init__(self) -> None:
+        if type(self.upper_bytes) is not int or self.upper_bytes <= 0:
+            raise ValueError("collective grid upper_bytes must be a positive integer")
+        if type(self.band) is not int or self.band < 0:
+            raise ValueError("collective grid band must be a nonnegative integer")
+
+
+@dataclass(frozen=True, kw_only=True)
+class CollectiveBucket:
+    """Compatible collective queries sharing a measured parameter shortlist.
+
+    ``parameters`` identifies the assignment projection retained by calibration.
+    Parameters outside that projection remain independently tunable per query.
+    """
+
+    identity: Mapping[str, object]
+    size_bytes: int
+    parameters: tuple[str, ...]
+    limit: int
+    grid: CollectiveGrid | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, Mapping) or not self.identity:
+            raise ValueError("collective bucket identity must be a nonempty mapping")
+        object.__setattr__(self, "identity", FrozenMapping(self.identity))
+        _identity(self.identity)
+        for name in ("size_bytes", "limit"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"collective bucket {name} must be a positive integer")
+        if self.grid is not None:
+            if not isinstance(self.grid, CollectiveGrid):
+                raise TypeError("collective bucket grid must be a CollectiveGrid")
+            if self.size_bytes > self.grid.upper_bytes:
+                raise ValueError("collective payload exceeds its grid interval")
+        parameters = tuple(self.parameters)
+        if (
+            isinstance(self.parameters, str)
+            or not parameters
+            or any(
+                not isinstance(name, str) or not name.isidentifier()
+                for name in parameters
+            )
+            or len(parameters) != len(set(parameters))
+        ):
+            raise ValueError("collective bucket parameters must be unique identifiers")
+        object.__setattr__(self, "parameters", parameters)
+
+
+@dataclass(frozen=True, kw_only=True)
 class TuningContract(Generic[QueryT, ConfigT]):
     component_id: str
     query_schema_version: int
@@ -256,10 +312,7 @@ class TuningContract(Generic[QueryT, ConfigT]):
         Callable[[QueryT, DeviceIdentity | None, ConfigT], object] | None
     ) = None
     collective_signature: Callable[[QueryT], Mapping[str, object]] | None = None
-    # Return the family knob, rank-independent bucket identity, and payload size.
-    collective_family_bucket: (
-        Callable[[QueryT], tuple[str, Mapping[str, object], int] | None] | None
-    ) = None
+    collective_bucket: Callable[[QueryT], CollectiveBucket | None] | None = None
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-z][a-z0-9_.-]*", self.component_id):

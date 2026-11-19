@@ -1,9 +1,12 @@
 """Logical PCIe operations with native transport and launch candidates."""
 
 from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
 
 from b12x.preparation import (
     AutotuneEffort,
+    CollectiveBucket,
+    CollectiveGrid,
     FixedMemoryRequirements,
     FrozenMapping,
     Knob,
@@ -413,9 +416,14 @@ def _validate_query(query, device):
             raise ValueError("selected gather tuning requires its DCP barrier profile")
 
 
+@lru_cache(maxsize=1)
+def _legal_configs(query, device):
+    return frozenset(_configs(query, device))
+
+
 def _validate_config(query, config, device):
-    if not isinstance(config, CollectiveConfig) or config not in tuple(
-        _configs(query, device)
+    if not isinstance(config, CollectiveConfig) or config not in _legal_configs(
+        query, device
     ):
         raise ValueError(
             "configuration is outside the native collective parameter space"
@@ -467,14 +475,60 @@ def _collective_signature(query):
     )
 
 
-def _family_bucket(query):
+def _island_bucket(query):
+    from math import prod
+
+    signature = _collective_signature(query)
+    sizes = set()
+    for native in signature["alternatives"].values():
+        call, setup = native["call"], native["setup"]
+        inp = call["inp"]
+        if inp["dtype"] != "torch.bfloat16":
+            return None
+        size = prod(inp["shape"]) * 2
+        sizes.add(size)
+        for tensor in (inp, call.get("output")):
+            if tensor is None:
+                continue
+            shape, strides = tensor["shape"], tensor["stride"]
+            if len(shape) != len(strides):
+                return None
+            contiguous_stride = 1
+            for extent, stride in zip(reversed(shape), reversed(strides)):
+                if extent != 1 and stride != contiguous_stride:
+                    return None
+                contiguous_stride *= extent
+            if prod(shape) * 2 != size:
+                return None
+            del tensor["shape"], tensor["stride"]
+        if not setup.get("active_blocks_override") and not setup.get("blocks_override"):
+            del call["active_blocks"]
+    if len(sizes) != 1:
+        raise ValueError("collective alternatives disagree on payload size")
+    size = sizes.pop()
+    step = max(16, (1 << (size.bit_length() - 1)) // 16)
+    return CollectiveBucket(
+        identity=dict(
+            version=2,
+            signature=signature,
+        ),
+        size_bytes=size,
+        parameters=tuple(knob.name for knob in TUNING.knobs),
+        limit=8,
+        grid=CollectiveGrid(
+            upper_bytes=-(-size // step) * step,
+            band=(size.bit_length() - 1) // 2,
+        ),
+    )
+
+
+def _bucket(query):
     if query.operation != "all_reduce":
         return None
-    if "twoshot_pairwise" in query.alternatives or any(
-        name in query.alternatives for name in ISLAND_VARIANTS
-    ):
-        # Retain independent measurements for each message shape and fixed grid.
+    if "twoshot_pairwise" in query.alternatives:
         return None
+    if any(name in query.alternatives for name in ISLAND_VARIANTS):
+        return _island_bucket(query)
     from math import prod
 
     alternatives = {}
@@ -510,9 +564,8 @@ def _family_bucket(query):
     upper = next((value for value in ladder if value >= units), None)
     if upper is None:
         upper = 1 << (units - 1).bit_length()
-    return (
-        "implementation",
-        dict(
+    return CollectiveBucket(
+        identity=dict(
             version=1,
             operation=query.operation,
             world_size=query.world_size,
@@ -520,7 +573,9 @@ def _family_bucket(query):
             upper_bytes=upper * 8192,
             alternatives=alternatives,
         ),
-        size,
+        size_bytes=size,
+        parameters=("implementation",),
+        limit=2,
     )
 
 
@@ -557,7 +612,7 @@ TUNING = TuningContract(
     ),
     parameters=_parameters,
     collective_signature=_collective_signature,
-    collective_family_bucket=_family_bucket,
+    collective_bucket=_bucket,
     equivalence_key=_equivalence_key,
 )
 

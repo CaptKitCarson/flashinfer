@@ -1,6 +1,6 @@
 """Tune TP16 IslandRS launches and replay mixed shapes on one fixed-grid owner."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import timedelta
 import os
 from pathlib import Path
@@ -11,7 +11,7 @@ from .test_collective_tuning_gpu import _drive
 from .test_island_rs_load_batches_gpu import _input, _ordered_reference
 
 
-def _worker(rank, directory, blocks):
+def _worker(rank, directory, blocks, online_ladder=False, reject_producer=False):
     import torch
     import torch.distributed as dist
     from b12x.comm.pcie import plan, query_from_runtime
@@ -39,6 +39,9 @@ def _worker(rank, directory, blocks):
     assert not owner.threads_override, "run without B12X_PCIE_ISLAND_RS_THREADS"
     try:
         for cached in (False, True):
+            if cached and online_ladder and rank == 0:
+                for path in (Path(directory) / "rank0").glob("*.json"):
+                    path.unlink()
             session = PreparationSession(
                 device=device,
                 cache_dir=Path(directory) / f"rank{rank}",
@@ -50,17 +53,30 @@ def _worker(rank, directory, blocks):
             )
             cases, requests = [], []
             observed_alignments = set()
-            for rows in (2, 128, 1024):
-                for inplace in (False, True):
-                    source_offset, output_offset = {
-                        2: (2, 4),
-                        128: (4, 2),
-                        1024: (0, 0),
-                    }[rows]
-                    shape = (rows, 7168)
+            produced = []
+            shapes = (
+                (
+                    (39, 7168),
+                    (40, 7168),
+                    (44, 7168),
+                    (896, 7168),
+                    (1024, 7168),
+                    (2048, 3584),
+                )
+                if online_ladder
+                else ((2, 7168), (128, 7168), (1024, 7168))
+            )
+            for shape in shapes:
+                rows, columns = shape
+                for inplace in (False,) if online_ladder else (False, True):
+                    source_offset, output_offset = (
+                        (0, 0)
+                        if online_ladder
+                        else {2: (2, 4), 128: (4, 2), 1024: (0, 0)}[rows]
+                    )
                     source = (
                         torch.empty(
-                            rows * 7168 + source_offset,
+                            rows * columns + source_offset,
                             device=device,
                             dtype=torch.bfloat16,
                         )[source_offset:].view(shape)
@@ -72,7 +88,7 @@ def _worker(rank, directory, blocks):
                         if inplace
                         else (
                             torch.empty(
-                                rows * 7168 + output_offset,
+                                rows * columns + output_offset,
                                 device=device,
                                 dtype=torch.bfloat16,
                             )[output_offset:].view(shape)
@@ -87,6 +103,42 @@ def _worker(rank, directory, blocks):
                         call={"inp": source, "out": output},
                     )
                     prepared = plan(query, runtime=owner)
+                    if (
+                        reject_producer
+                        and rows == (39 if online_ladder else 2)
+                        and not inplace
+                    ):
+                        original_factory = prepared._benchmark_call
+
+                        def rejecting(state, factory=original_factory):
+                            call = factory(state)
+
+                            def producer(index, function):
+                                def run():
+                                    produced.append(index)
+                                    function()
+
+                                return run
+
+                            def validate():
+                                call.validate()
+                                if rank == 0:
+                                    raise ValueError(
+                                        "injected first-producer validation failure"
+                                    )
+
+                            return replace(
+                                call,
+                                benchmark_producers=tuple(
+                                    producer(index, function)
+                                    for index, function in enumerate(
+                                        call.benchmark_producers
+                                    )
+                                ),
+                                validate=validate,
+                            )
+
+                        prepared = replace(prepared, _benchmark_call=rejecting)
 
                     def benchmark(
                         state,
@@ -108,7 +160,7 @@ def _worker(rank, directory, blocks):
                         observed.add((input_alignment, output_alignment, inplace))
                         return call
 
-                    name = f"rows{rows}-inplace{int(inplace)}"
+                    name = f"rows{rows}-columns{columns}-inplace{int(inplace)}"
                     requests.append(
                         prepared.request(
                             name=name,
@@ -117,14 +169,44 @@ def _worker(rank, directory, blocks):
                                     state, inp=source, out=output
                                 )
                             ),
-                            benchmark_call=benchmark,
+                            benchmark_call=None if online_ladder else benchmark,
                             collective=CollectiveRequirement(name, tuple(range(16))),
                         )
                     )
                     cases.append((source, output, seed, prepared, inplace))
+            if reject_producer:
+                try:
+                    with pytest.raises(
+                        RuntimeError, match="injected first-producer validation failure"
+                    ):
+                        _drive(session, requests)
+                    assert produced == [0]
+                finally:
+                    session.close()
+                return
             result = _drive(session, requests)
             assert (result.benchmarked_candidates == 0) == cached
-            if not cached:
+            if online_ladder:
+                counts = sorted(
+                    coverage["measured_count"] for coverage in result.coverage.values()
+                )
+                assert counts[:2] == [0, 0]
+                assert 8 <= counts[2] <= 16
+                assert counts[3:] == [175, 175, 175]
+                assert result.benchmarked_candidates == (0 if cached else sum(counts))
+                assert result.cache_hits == (6 if cached else 0)
+                selected = {
+                    name: value.config for name, value in result.selections.items()
+                }
+                assert (
+                    selected["rows39-columns7168-inplace0"]
+                    == selected["rows40-columns7168-inplace0"]
+                )
+                assert (
+                    selected["rows2048-columns3584-inplace0"]
+                    == selected["rows1024-columns7168-inplace0"]
+                )
+            elif not cached:
                 assert observed_alignments == {
                     (4, 8, False),
                     (4, 4, True),
@@ -212,3 +294,34 @@ def test_island_rs_participation_tuning_and_cached_replay(tmp_path, blocks):
     if torch.cuda.device_count() != 16 or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires sixteen SM120 GPUs")
     mp.spawn(_worker, args=(str(tmp_path), blocks), nprocs=16, join=True)
+
+
+@pytest.mark.skipif(
+    os.getenv("B12X_RUN_COLLECTIVE_TUNING_TEST") != "1",
+    reason="requires sixteen peer-accessible SM120 GPUs",
+)
+def test_island_online_ladder_and_peer_cache_reuse(tmp_path):
+    import torch
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() != 16 or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("requires sixteen SM120 GPUs")
+    mp.spawn(_worker, args=(str(tmp_path), None, True), nprocs=16, join=True)
+
+
+@pytest.mark.skipif(
+    os.getenv("B12X_RUN_COLLECTIVE_TUNING_TEST") != "1",
+    reason="requires sixteen peer-accessible SM120 GPUs",
+)
+@pytest.mark.parametrize("online_ladder", (False, True))
+def test_island_validation_failure_stops_before_the_next_producer(
+    tmp_path, online_ladder
+):
+    import torch
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() != 16 or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("requires sixteen SM120 GPUs")
+    mp.spawn(
+        _worker, args=(str(tmp_path), None, online_ladder, True), nprocs=16, join=True
+    )

@@ -74,8 +74,8 @@ Preparation races five transports over 128, 256, 512, 768, and 1024 threads and
 the active-CTA counts admitted by the channel's physical grid, capped at 64 CTAs
 and one CTA per SM. Explicit launch overrides retain their declared
 participation. All choices share peer mappings, ordered FP32 sums, and BF16
-conversion points. Each shape and input/output alias pattern keeps its own
-selection.
+conversion points. Selection records retain the exact shape and input/output
+alias pattern.
 
 The SM transports combine local pull or push with cross-island full reduction
 or reduce-scatter/all-gather. They launch the fixed physical grid. Every physical
@@ -105,17 +105,31 @@ Across preparation batches in one session, the first completed calibration for
 a bucket supplies its shortlist. Buckets are independent for each ordered GPU
 group, dtype, aliasing contract, transport catalog, and staging-storage geometry.
 
+Default-effort IslandRS all-reduce tuning groups contiguous BF16 payloads into
+sixteen intervals per power-of-two size range, with a minimum interval width of
+16 bytes. The largest declared payload in each interval represents that interval.
+The smallest representative and each power-of-four size band's largest
+representative race the complete eligible catalog. Other representatives race
+the union of the best eight configurations from each bracketing full search.
+Every remaining shape adopts its interval representative's winning configuration.
+On a cache miss, that shape still binds the selected configuration and validates
+every benchmark input producer on all ranks before saving its selection; it
+performs no timed race.
+The complete catalog remains available for program discovery and rank agreement.
+
 Calibration shortlists are saved with their representative selections. Exact
 selections include the calibration's program-aware cache identity and retained
-families, so a changed calibration cannot reuse an incompatible selection.
+choices, so a changed calibration cannot reuse an incompatible selection. IslandRS
+records include their bracketing or interval representative's decisions. Request
+labels do not affect cache identity. Calibration groups retain the ordered ranks,
+GPU identities, eligible configurations, layouts, aliasing, and owner geometry.
 Audit effort measures the unrestricted catalog. Explicit pins and disabled
 tuning bypass calibration. Caller-supplied benchmark contexts and dependent
 requests do not share built-in calibration. Requests retaining measured finalists
 preserve their complete family catalogs. Fused arithmetic and DCP operations
-retain their shape-specific searches. TP4 BF16 push all-reduce catalogs with
-an admitted pairwise two-shot candidate also bypass family pruning so each
-shape measures the complete catalog; other devices retain bucket calibration. A bucket shortlist is empirical: performance
-within a bucket should be checked against audit races when changing transport
+retain their shape-specific searches. TP4 BF16 push all-reduce also measures
+the complete catalog at each shape when the device admits a pairwise two-shot
+candidate. Check performance within each bucket against audit races when changing transport
 kernels or bucket boundaries.
 
 Hierarchical collectives, DMA rings, FP8 sequence-parallel transports, paired gathers,
@@ -139,7 +153,9 @@ bytes, including NaN payloads and FP32 values transported through BF16 views.
 A caller can supply an explicit `benchmark_call` for a different representative
 execution context.
 
-All ranks compile and bind a candidate before any rank primes it. Each rank
+All ranks compile and bind a candidate before any rank primes it. Each benchmark
+producer completes validation on every rank before the next producer runs. A
+validation error or cancellation stops the group at that boundary. Each rank
 queues one sample behind a stream gate; the coordinator releases it after every
 rank reports readiness. An untimed replay precedes input production and the
 timed replay to absorb rank-release skew. Each sample drains before submission
@@ -183,6 +199,12 @@ The test exercises duplicate declarations, cache reuse with a missing member
 cache, one-rank cancellation, inconsistent shapes, cache-only misses, and graph
 replay. `benchmarks/experimental/b12x/benchmark_pcie_allreduce_transports.py`
 compares explicit transports and the static dispatch policy with CUDA graphs.
+
+With sixteen visible SM120 GPUs, run
+`tests/experimental/b12x/comm/test_island_rs_tuning_gpu.py` with the same test
+opt-in. It checks interval selection, recovery from a missing member cache,
+validation-failure propagation, and allocation-stable mixed-shape graph replay
+with changing inputs.
 
 ## Joint BF16 profiles
 

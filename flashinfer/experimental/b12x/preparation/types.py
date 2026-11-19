@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 if TYPE_CHECKING:
     from b12x._lib.compile_pool import CompileJob
     from b12x._lib.scratch import ScratchBufferSpec
+    from ._collective import _CollectiveCalibrationRecord
     from .device import DetectedDevice
     from .tuning import TuningContract
 
@@ -614,6 +615,7 @@ class _Prepared:
     device: DetectedDevice
     finalist_policy: FinalistPolicy | None = None
     finalists: tuple[FinalistRecord, ...] = ()
+    collective_tuning: _CollectiveCalibrationRecord | None = None
     variants: Mapping[int, Plan] | None = None
     scratch: tuple[ScratchBufferSpec, ...] | None = None
     users: list = field(default_factory=list)
