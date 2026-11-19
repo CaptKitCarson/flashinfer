@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from b12x.preparation import (
+    FixedMemoryRequirements,
     FrozenMapping,
     MemoryRequirements,
     PersistentMemory,
@@ -892,14 +893,16 @@ def plan(
                 CompileJob.DEVICE_ORDINAL,
             ),
         ),
-        _memory_requirements=lambda config, device: MemoryRequirements(
-            persistent=(
-                PersistentMemory(
-                    ("pcie-oneshot-runtime", id(runtime)),
-                    resident,
-                    resident,
+        _memory_requirements=FixedMemoryRequirements(
+            MemoryRequirements(
+                persistent=(
+                    PersistentMemory(
+                        ("pcie-oneshot-runtime", id(runtime)),
+                        resident,
+                        resident,
+                    ),
                 ),
-            ),
+            )
         ),
         _materialize=materialize,
         _device=runtime.device,

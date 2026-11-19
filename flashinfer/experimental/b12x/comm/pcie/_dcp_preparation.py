@@ -17,6 +17,7 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.compile_plan import load_programs
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
+    FixedMemoryRequirements,
     FrozenMapping,
     MemoryRequirements,
     PersistentMemory,
@@ -430,14 +431,16 @@ def plan(
                 CompileJob.DEVICE_ORDINAL,
             ),
         ),
-        _memory_requirements=lambda config, device: MemoryRequirements(
-            persistent=(
-                ()
-                if query.surface == "kimi_topk16"
-                else (
-                    PersistentMemory(
-                        ("pcie-dcp-runtime", id(runtime)), resident, resident
-                    ),
+        _memory_requirements=FixedMemoryRequirements(
+            MemoryRequirements(
+                persistent=(
+                    ()
+                    if query.surface == "kimi_topk16"
+                    else (
+                        PersistentMemory(
+                            ("pcie-dcp-runtime", id(runtime)), resident, resident
+                        ),
+                    )
                 )
             )
         ),

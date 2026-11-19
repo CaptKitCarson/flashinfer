@@ -263,6 +263,22 @@ class MemoryRequirements:
 
 
 @dataclass(frozen=True)
+class FixedMemoryRequirements:
+    """Memory owned by a fixed binding, independent of configuration and plan state."""
+
+    requirements: MemoryRequirements
+
+    def __post_init__(self):
+        if not isinstance(self.requirements, MemoryRequirements):
+            raise TypeError("fixed memory requires MemoryRequirements")
+        self.requirements._persistent_by_key()
+        hash(self.requirements)
+
+    def __call__(self, config, device):
+        return self.requirements
+
+
+@dataclass(frozen=True)
 class Selection(Generic[ConfigT]):
     component_id: str
     query: FrozenMapping

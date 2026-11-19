@@ -13,12 +13,12 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     CollectiveRequirement,
+    FixedMemoryRequirements,
     FrozenMapping,
     MemoryRequirements,
     PersistentMemory,
     Plan,
     PreparedCall,
-    current_plan,
 )
 
 from ._tuning import PcieConfig, PcieQuery, TUNING
@@ -334,19 +334,18 @@ def plan(
     ):
         raise ValueError("query differs from the island owner's fixed physical grid")
 
-    def memory(_config, _device):
-        slab = int(query.setup["slab_bytes"])
-        # The runtime allocated this slab before declaration. Account its real
-        # residency without claiming an allocation owned by the session.
-        return MemoryRequirements(
+    slab = int(query.setup["slab_bytes"])
+    memory = FixedMemoryRequirements(
+        MemoryRequirements(
             persistent=(
                 PersistentMemory(
-                    ("comm.pcie", query.surface, current_plan(), "slab"),
+                    ("comm.pcie", query.surface, id(runtime), "slab"),
                     slab,
                     slab,
                 ),
             )
         )
+    )
 
     def materialize(selection, device):
         from ._island_copy import PacketPrograms

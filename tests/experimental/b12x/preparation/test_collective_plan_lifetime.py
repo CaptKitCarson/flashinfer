@@ -35,18 +35,23 @@ def no_cuda_initialization(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", refuse)
 
 
-def island_plan():
-    owner = object.__new__(PCIeIslandRSAllReduce)
-    owner.rank, owner.world_size, owner.device = 0, 16, torch.device("cpu")
-    owner.blocks, owner.blocks_override = 64, False
-    owner.threads, owner.threads_override, owner.wait_nanosleep_cycles = 512, False, 24
-    owner.max_elements = 64 * 7168
-    owner.quarter_capacity = ((owner.max_elements // 2 + 3) // 4 + 7) // 8 * 8
-    owner.stage_offset = HEADER_BYTES
-    owner.part_offset = owner.stage_offset + 2 * owner.quarter_capacity * 16
-    owner.final_offset = owner.part_offset + 2 * owner.quarter_capacity * 4
-    owner.slab_bytes = owner.final_offset + 2 * owner.quarter_capacity * 16
-    owner._mapped_peers = island_rs_peers(0, 16)
+def island_plan(owner=None):
+    if owner is None:
+        owner = object.__new__(PCIeIslandRSAllReduce)
+        owner.rank, owner.world_size, owner.device = 0, 16, torch.device("cpu")
+        owner.blocks, owner.blocks_override = 64, False
+        owner.threads, owner.threads_override, owner.wait_nanosleep_cycles = (
+            512,
+            False,
+            24,
+        )
+        owner.max_elements = 64 * 7168
+        owner.quarter_capacity = ((owner.max_elements // 2 + 3) // 4 + 7) // 8 * 8
+        owner.stage_offset = HEADER_BYTES
+        owner.part_offset = owner.stage_offset + 2 * owner.quarter_capacity * 16
+        owner.final_offset = owner.part_offset + 2 * owner.quarter_capacity * 4
+        owner.slab_bytes = owner.final_offset + 2 * owner.quarter_capacity * 16
+        owner._mapped_peers = island_rs_peers(0, 16)
     source = torch.empty((64, 7168), dtype=torch.bfloat16)
     output = torch.empty_like(source)
     query = _preparation.query_from_runtime(
@@ -86,17 +91,35 @@ def test_full_candidate_envelope_releases_real_native_plans(monkeypatch):
                     ),
                 )
             )
-        expected = len(plans) * len(configurations(plans[0]))
+        declared = len(children)
         session = PreparationSession(device=DEVICE, compile_workers=0)
         try:
             envelope = session.candidate_memory_envelope(requests)
             gc.collect()
-            assert len(children) == expected
+            assert len(children) == declared
             assert all(child() is None for child in children)
             assert envelope.scratch_nbytes == envelope.pending_persistent_nbytes == 0
             assert len(envelope.persistent) == len(plans)
         finally:
             session.close()
+
+
+def test_layer_bindings_account_one_resident_runtime_slab():
+    first, owner, _, _ = island_plan()
+    plans = [first, *(island_plan(owner)[0] for _ in range(31))]
+    requests = [
+        plan.request(name=f"layer{index}.reduce", prepare_call=lambda state: None)
+        for index, plan in enumerate(plans)
+    ]
+    with (
+        autotune_effort("default"),
+        PreparationSession(device=DEVICE, compile_workers=0) as session,
+    ):
+        session.configure_scratch_limit(0)
+        envelope = session.candidate_memory_envelope(requests)
+    assert envelope.scratch_nbytes == envelope.pending_persistent_nbytes == 0
+    assert len(envelope.persistent) == 1
+    assert envelope.persistent[0].resident_nbytes == owner.slab_bytes
 
 
 @pytest.mark.parametrize("implementation", ["island_push_rsag", "island_hybrid_rsag"])

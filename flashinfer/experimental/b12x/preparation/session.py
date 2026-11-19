@@ -22,7 +22,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from pathlib import Path
 
 from filelock import Timeout
@@ -52,6 +52,7 @@ from .types import (
     CandidateResourceIneligibleError,
     CollectiveRequirement,
     CollectiveTuningRequirement,
+    FixedMemoryRequirements,
     FrozenMapping,
     MemoryRequirements,
     Plan,
@@ -107,6 +108,10 @@ class _Obligation:
     discovery: _Discovery | None = None
     compiles_submitted: bool = False
     payloads: dict = field(default_factory=dict)
+
+    @cached_property
+    def memory_requests(self):
+        return _memory_requests(self.requests or (self.request,))
 
 
 @dataclass
@@ -361,6 +366,17 @@ def _coalesce_requests(requests):
     return tuple(tuple(group) for group in groups.values())
 
 
+def _memory_requests(requests):
+    """Keep one representative for each fixed memory binding or dynamic plan."""
+    distinct = {}
+    for request in requests:
+        plan = request.plan
+        memory = plan._memory_requirements
+        key = (memory, plan.shared) if type(memory) is FixedMemoryRequirements else plan
+        distinct.setdefault(key, request)
+    return tuple(distinct.values())
+
+
 def _plans_of(request):
     """Return a request plan and every child plan of a composite request."""
     plan = request.plan
@@ -524,23 +540,30 @@ class PreparationSession:
         self._scratch_limit = max_bytes
 
     def _candidate_memory(self, requests, config):
-        requirements, seen, shared = [], set(), False
-        for request in requests:
-            plan = request.plan
-            if plan in seen:
-                continue
-            seen.add(plan)
-            if plan.shared and shared and self._scratch_limit is None:
-                continue
-            with _plan_scope(plan):
-                requirement = plan._memory_requirements(config, self.device)
-            requirements.append(
-                replace(requirement, persistent=())
-                if plan.shared and shared
-                else requirement
-            )
-            shared |= plan.shared
-        requirement = MemoryRequirements.sequential(requirements)
+        if (
+            len(requests) == 1
+            and type(requests[0].plan._memory_requirements) is FixedMemoryRequirements
+        ):
+            requirement = requests[0].plan._memory_requirements.requirements
+        else:
+            requirements, shared = [], False
+            for request in requests:
+                plan = request.plan
+                if plan.shared and shared and self._scratch_limit is None:
+                    continue
+                memory = plan._memory_requirements
+                if type(memory) is FixedMemoryRequirements:
+                    requirement = memory.requirements
+                else:
+                    with _plan_scope(plan):
+                        requirement = memory(config, self.device)
+                requirements.append(
+                    replace(requirement, persistent=())
+                    if plan.shared and shared
+                    else requirement
+                )
+                shared |= plan.shared
+            requirement = MemoryRequirements.sequential(requirements)
         if (
             self._scratch_limit is not None
             and requirement.scratch_nbytes > self._scratch_limit
@@ -738,6 +761,7 @@ class PreparationSession:
         expanded, _ = _expand_requests(tuple(requests))
         requirements = []
         for requests in _coalesce_requests(expanded):
+            requests = _memory_requests(requests)
             plan = requests[0].plan
             configuration = plan.contract.configure(
                 plan.query,
@@ -1469,9 +1493,7 @@ class PreparationJob:
 
     def _selection(self, obligation, config, source, assignment=None):
         if self.session._scratch_limit is not None:
-            self.session._candidate_memory(
-                obligation.requests or (obligation.request,), config
-            )
+            self.session._candidate_memory(obligation.memory_requests, config)
         return Selection(
             obligation.request.plan.component_id,
             obligation.configuration.encoded_query,
@@ -1483,7 +1505,7 @@ class PreparationJob:
     def _validate_retained_scratch(self, obligation, prepared):
         if self.session._scratch_limit is None:
             return
-        requests = obligation.requests or (obligation.request,)
+        requests = obligation.memory_requests
         self.session._candidate_memory(requests, prepared.selection.config)
         plan = obligation.request.plan
         for item in prepared.finalists:
@@ -1517,7 +1539,7 @@ class PreparationJob:
             if item.assignment != FrozenMapping(assignment):
                 raise ValueError("finalist assignment differs from its candidate index")
             if self.session._scratch_limit is not None:
-                self.session._candidate_memory(obligation.requests, config)
+                self.session._candidate_memory(obligation.memory_requests, config)
             family = FrozenMapping(
                 {name: assignment[name] for name in policy.family_fields}
             )
@@ -1807,7 +1829,9 @@ class PreparationJob:
                         eligible = []
                         for candidate in obligation.candidates:
                             try:
-                                self.session._candidate_memory(requests, candidate[1])
+                                self.session._candidate_memory(
+                                    obligation.memory_requests, candidate[1]
+                                )
                             except CandidateResourceIneligibleError:
                                 continue
                             eligible.append(candidate)
@@ -1844,7 +1868,7 @@ class PreparationJob:
                         )
                     if obligation.selection is None:
                         obligation.coverage = dict(coverage)
-            for item in requests:
+            for item in obligation.memory_requests:
                 if (
                     item.plan.prepared is not None
                     and item.plan.selection == obligation.selection
@@ -1858,10 +1882,12 @@ class PreparationJob:
                     if obligation.selection is None
                     else obligation.selection.config
                 )
-                with _plan_scope(item.plan):
-                    requirements.append(
-                        item.plan._memory_requirements(config, self.session.device)
-                    )
+                memory = item.plan._memory_requirements
+                if type(memory) is FixedMemoryRequirements:
+                    requirements.append(memory.requirements)
+                else:
+                    with _plan_scope(item.plan):
+                        requirements.append(memory(config, self.session.device))
             self._planned_requests += 1
             yield "metadata"
         MemoryRequirements.sequential(requirements)
@@ -2913,7 +2939,9 @@ class PreparationJob:
             if self.session._scratch_limit is not None:
                 payload = plan.contract.config_payload(selected.config)
                 if payload not in validated_scratch:
-                    self.session._candidate_memory(obligation.requests, selected.config)
+                    self.session._candidate_memory(
+                        obligation.memory_requests, selected.config
+                    )
                     validated_scratch.add(payload)
 
         def warmup_selection(prepared):

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, replace
 
 from b12x.preparation import (
     AutotuneEffort,
+    FixedMemoryRequirements,
     FrozenMapping,
     Knob,
     ParameterBinding,
@@ -608,6 +609,20 @@ def plan(
         q = replace(q, call=FrozenMapping(call))
         return _provider(q.surface).plan(q, runtime=runtime)
 
+    memory_by_implementation = {
+        name: _provider(q.surface).plan(q, runtime=runtime)._memory_requirements
+        for name, (q, runtime) in alternatives.items()
+    }
+    first_memory = next(iter(memory_by_implementation.values()))
+    if isinstance(first_memory, FixedMemoryRequirements) and all(
+        memory == first_memory for memory in memory_by_implementation.values()
+    ):
+        memory = first_memory
+    else:
+
+        def memory(config, device):
+            return memory_by_implementation[config.implementation](config, device)
+
     return Plan(
         contract=TUNING,
         query=query,
@@ -616,9 +631,7 @@ def plan(
         _compile_jobs=lambda config, device: native(config)._compile_jobs(
             config, device
         ),
-        _memory_requirements=lambda config, device: native(config)._memory_requirements(
-            config, device
-        ),
+        _memory_requirements=memory,
         _materialize=lambda selection, device: native(selection.config)._materialize(
             selection, device
         ),

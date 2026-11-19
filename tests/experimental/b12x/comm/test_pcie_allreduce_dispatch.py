@@ -301,20 +301,40 @@ def test_tp10_unqualified_declarations_preserve_hierarchy(
     assert manager.algorithm == "hierarchical"
 
 
+def _oneshot_plan_runtime(world):
+    native = SimpleNamespace(
+        eager_buffer_bytes=16384, transport_policy=(False, False, True, True, False)
+    )
+    runtime = SimpleNamespace(
+        rank=0,
+        world_size=world,
+        device=torch.device("cpu"),
+        single_channel=True,
+        rank_data=torch.empty(128, dtype=torch.uint8),
+        _ptr=1,
+        _ext=SimpleNamespace(_state=lambda ptr: native, meta_size=lambda: 256),
+        _sentinel_supported=True,
+        _owned_buffers=[object()],
+    )
+    runtime._prepared_channel_for_stream = lambda stream, channel: runtime
+    return runtime
+
+
 @pytest.mark.parametrize("world", (2, 4))
 @pytest.mark.parametrize("joint_blocks", (0, 64))
 @pytest.mark.parametrize("option", (None, False, True))
 def test_public_plan_requires_explicit_joint_opt_in(
     monkeypatch, world, joint_blocks, option
 ):
-    from b12x.comm.pcie import _preparation
+    from b12x.comm.pcie import _oneshot_preparation, _preparation
     from b12x.comm.pcie._joint_profile import JOINT_FAMILIES
     from b12x.comm.pcie._tuning import PcieQuery
     from b12x.preparation import FrozenMapping, autotune_effort
 
-    runtime = SimpleNamespace(rank=0, world_size=world, device=torch.device("cpu"))
-    runtime.single_channel = True
-    runtime._prepared_channel_for_stream = lambda stream, channel: runtime
+    runtime = _oneshot_plan_runtime(world)
+    rank_bytes, slab_bytes, slabs = _oneshot_preparation._owned_resident_layout(
+        runtime, _oneshot_preparation._state(runtime)
+    )
     manager = dispatch.PCIeAllReduce(runtime, "oneshot")
     query = PcieQuery(
         surface="OneshotAllReduce.all_reduce",
@@ -341,6 +361,10 @@ def test_public_plan_requires_explicit_joint_opt_in(
                 eager_storage_shards=1 + 2 * (world - 1) + world,
                 variants=((False, 0), (True, 0), (True, 1)),
                 joint_max_blocks=joint_blocks,
+                rank_data_nbytes=rank_bytes,
+                owned_slab_nbytes=slab_bytes,
+                owned_slab_count=slabs,
+                joint_workspace_nbytes=0,
             )
         ),
     )
@@ -391,15 +415,17 @@ def test_tp4_plan_only_offers_pairwise_for_push(
     monkeypatch.setattr(
         dispatch, "detect_device", lambda d: SimpleNamespace(identity=device)
     )
-    runtime = SimpleNamespace(
-        rank=0, world_size=4, device=torch.device("cpu"), single_channel=True
+    runtime = _oneshot_plan_runtime(4)
+    twoshot = SimpleNamespace(
+        accepts=lambda inp: True, rank=0, world_size=4, device=runtime.device
     )
-    runtime._prepared_channel_for_stream = lambda stream, channel: runtime
-    twoshot = SimpleNamespace(accepts=lambda inp: True)
     manager = dispatch.PCIeAllReduce(runtime, "oneshot", bf16_twoshot=twoshot)
     monkeypatch.setattr(manager, "_use_bf16_twoshot", lambda *args: prefer_twoshot)
 
     def query(owner, *, surface, call):
+        setup = dict(shape=(256,))
+        if owner is twoshot:
+            setup.update(slab_nbytes=16384, push_shard_nbytes=512)
         return PcieQuery(
             surface=surface,
             world_size=4,
@@ -417,7 +443,7 @@ def test_tp4_plan_only_offers_pairwise_for_push(
                     size_packs=32,
                 )
             ),
-            setup=FrozenMapping(dict(shape=(256,))),
+            setup=FrozenMapping(setup),
         )
 
     monkeypatch.setattr(_preparation, "query_from_runtime", query)

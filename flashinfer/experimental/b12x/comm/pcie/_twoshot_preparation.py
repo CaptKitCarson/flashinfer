@@ -17,12 +17,12 @@ from b12x._lib.compile_plan import load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
+    FixedMemoryRequirements,
     FrozenMapping,
     MemoryRequirements,
     PersistentMemory,
     Plan,
     PreparedCall,
-    current_plan,
 )
 
 from ._tuning import PAIRWISE_THREADS, PAIRWISE_BLOCKS, PcieConfig, PcieQuery, TUNING
@@ -566,28 +566,27 @@ def plan(
             ),
         )
 
-    def memory(config, device):
-        required = int(query.setup["slab_nbytes"])
-        shard_bytes = int(query.setup["push_shard_nbytes"])
-        shard = (
-            (
-                PersistentMemory(
-                    (current_plan(), "pcie_twoshot_push_shard"),
-                    shard_bytes,
-                    shard_bytes,
-                ),
-            )
-            if shard_bytes
-            else ()
+    required = int(query.setup["slab_nbytes"])
+    shard_bytes = int(query.setup["push_shard_nbytes"])
+    shard = (
+        (
+            PersistentMemory(
+                (id(runtime), "pcie_twoshot_push_shard"), shard_bytes, shard_bytes
+            ),
         )
-        return MemoryRequirements(
+        if shard_bytes
+        else ()
+    )
+    memory = FixedMemoryRequirements(
+        MemoryRequirements(
             persistent=(
                 PersistentMemory(
-                    (current_plan(), "pcie_twoshot_channel"), required, required
+                    (id(runtime), "pcie_twoshot_channel"), required, required
                 ),
             )
             + shard
         )
+    )
 
     def materialize(selection, device):
         launchers = load_programs(compile_twoshot_surface(payload, device.ordinal))

@@ -11,6 +11,7 @@ from b12x.preparation import (
     CandidateResourceIneligibleError,
     CollectiveRequirement,
     FinalistPolicy,
+    FixedMemoryRequirements,
     MemoryRequirements,
     PersistentMemory,
     PreparedCall,
@@ -151,6 +152,113 @@ def test_coalesced_bindings_all_constrain_the_catalog(tmp_path, monkeypatch):
         assert result.selections["first"].config == Config(2)
         assert result.selections["second"].config == Config(2)
     assert materialized == [2]
+
+
+def _fixed_request(name, *, owner, scratch_bytes=256, persistent_bytes=16):
+    item = _request(name, tuning=contract())
+    return replace(
+        item,
+        plan=replace(
+            item.plan,
+            _memory_requirements=FixedMemoryRequirements(
+                MemoryRequirements(
+                    scratch=(
+                        ScratchBufferSpec(
+                            name="workspace",
+                            shape=(scratch_bytes,),
+                            dtype=torch.uint8,
+                            device=torch.device("cpu"),
+                        ),
+                    ),
+                    persistent=(PersistentMemory(owner, persistent_bytes),),
+                )
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("count", (1, 64))
+def test_fixed_binding_is_sized_once_per_candidate_across_layers(
+    tmp_path, monkeypatch, count
+):
+    _deterministic_timer(monkeypatch)
+    requests = tuple(_fixed_request(f"layer{i}", owner="slab") for i in range(count))
+    with session(tmp_path) as engine:
+        engine.configure_scratch_limit(256)
+        measured_bindings = []
+        candidate_memory = engine._candidate_memory
+
+        def observe(bindings, config):
+            measured_bindings.append(len(bindings))
+            return candidate_memory(bindings, config)
+
+        monkeypatch.setattr(engine, "_candidate_memory", observe)
+        envelope = engine.candidate_memory_envelope(requests)
+        assert envelope.scratch_nbytes == 256
+        assert envelope.pending_persistent_nbytes == 16
+        result = engine.prepare(requests)
+        assert result.benchmarked_candidates == 3
+        assert len(result.selections) == count
+        assert all(
+            selected.config == Config(2) for selected in result.selections.values()
+        )
+        assert set(measured_bindings) == {1}
+        assert all(item.plan.prepared is not None for item in requests)
+
+
+def test_fixed_bindings_preserve_distinct_storage_owners(tmp_path):
+    first = _fixed_request("first", owner="first-slab")
+    repeated = _fixed_request("repeated", owner="first-slab")
+    second = _fixed_request("second", owner="second-slab", persistent_bytes=32)
+    with session(tmp_path) as engine:
+        envelope = engine.candidate_memory_envelope((first, repeated, second))
+        assert envelope.pending_persistent_nbytes == 48
+        assert {entry.key for entry in envelope.persistent} == {
+            "first-slab",
+            "second-slab",
+        }
+
+
+def test_different_fixed_workspace_binding_constrains_admission(tmp_path):
+    first = _fixed_request("first", owner="slab", scratch_bytes=256)
+    second = _fixed_request("second", owner="slab", scratch_bytes=768)
+    with session(tmp_path) as engine:
+        engine.configure_scratch_limit(512)
+        with pytest.raises(CandidateResourceIneligibleError, match="no eligible"):
+            engine.candidate_memory_envelope((first, second))
+        with pytest.raises(CandidateResourceIneligibleError, match="no eligible"):
+            engine.prepare((first, second))
+
+
+def test_replacing_fixed_memory_callback_restores_dynamic_binding_checks(
+    tmp_path, monkeypatch
+):
+    _deterministic_timer(monkeypatch)
+    first = _fixed_request("first", owner="slab")
+    second = _fixed_request("second", owner="slab")
+    memory = _request().plan._memory_requirements
+    second = replace(second, plan=replace(second.plan, _memory_requirements=memory))
+    with session(tmp_path) as engine:
+        engine.configure_scratch_limit(512)
+        envelope = engine.candidate_memory_envelope((first, second))
+        assert envelope.scratch_nbytes == 512
+        assert envelope.pending_persistent_nbytes == 32
+        result = engine.prepare((first, second))
+        assert result.benchmarked_candidates == 2
+        assert result.selections["first"].config == Config(2)
+        assert result.selections["second"].config == Config(2)
+
+
+def test_fixed_memory_rejects_conflicting_residency():
+    with pytest.raises(ValueError, match="conflicting residency"):
+        FixedMemoryRequirements(
+            MemoryRequirements(
+                persistent=(
+                    PersistentMemory("slab", 16, 4),
+                    PersistentMemory("slab", 32, 8),
+                )
+            )
+        )
 
 
 def test_shared_bindings_count_persistent_storage_once(tmp_path):
@@ -379,9 +487,7 @@ def test_warmup_checks_each_retained_configuration_across_all_bindings(tmp_path)
         assert second.plan.selection.config == Config(2)
 
 
-def test_shared_alias_configuration_rechecks_the_entire_installation_group(tmp_path):
-    from b12x.preparation.session import PreparationJob, _Obligation, _declaration_key
-
+def test_shared_alias_preserves_the_eligible_installation_group_configuration(tmp_path):
     tuning = contract(default=1)
     first = _request("first", tuning=tuning, scale=256)
     alias = _request("alias", tuning=tuning, scale=128, shared=True)
@@ -389,24 +495,33 @@ def test_shared_alias_configuration_rechecks_the_entire_installation_group(tmp_p
     owner = _request("owner", tuning=tuning, scale=128, shared=True)
     with session(tmp_path) as engine:
         engine.configure_scratch_limit(256)
-        configuration = tuning.configure(first.plan.query, device=None)
-        selected = _install_payload(first, configuration, Config(1), engine.device)
-        _install_payload(last, configuration, Config(1), engine.device)
-        _install_payload(owner, configuration, Config(2), engine.device)
-        engine._shared[_declaration_key(owner.plan)] = owner.plan
-        requests = (first, alias, last)
-        obligation = _Obligation(
-            first,
-            configuration,
-            requests=requests,
-            selection=selected,
-            ready=True,
+        engine.prepare((owner,), selected_configs={owner.plan: Config(2)})
+        owner_payload = owner.plan.prepared
+        engine.prepare((first, last), selected_configs={first.plan: Config(1)})
+        result = engine.prepare((first, alias, last))
+        assert all(
+            result.selections[name].config == Config(1)
+            for name in ("first", "alias", "last")
         )
-        job = PreparationJob(engine, requests, autotune=True)
+        assert alias.plan.prepared is not owner_payload
+        assert owner.plan.prepared is owner_payload
+        assert owner.plan.selection.config == Config(2)
+
+
+def test_shared_alias_configuration_rechecks_the_entire_preparation_group(tmp_path):
+    tuning = contract(default=1)
+    owner = _request("owner", tuning=tuning, scale=128, shared=True)
+    alias = _request("alias", tuning=tuning, scale=128, shared=True)
+    larger = _request("larger", tuning=tuning, scale=256)
+    with session(tmp_path) as engine:
+        engine.configure_scratch_limit(256)
+        engine.prepare((owner,), selected_configs={owner.plan: Config(2)})
+        owner_payload = owner.plan.prepared
         with pytest.raises(CandidateResourceIneligibleError, match="scratch limit"):
-            list(job._install_obligation(obligation, {}))
-        assert alias.plan.prepared is owner.plan.prepared
-        assert last.plan.selection.config == Config(1)
+            engine.prepare((alias, larger))
+        assert alias.plan.prepared is None
+        assert larger.plan.prepared is None
+        assert owner.plan.prepared is owner_payload
 
 
 def test_warmup_default_binding_checks_scale_linearly(tmp_path):

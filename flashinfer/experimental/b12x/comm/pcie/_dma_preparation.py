@@ -9,12 +9,12 @@ import torch
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
+    FixedMemoryRequirements,
     FrozenMapping,
     MemoryRequirements,
     PersistentMemory,
     Plan,
     PreparedCall,
-    current_plan,
 )
 
 from ._dma_kernels import DmaLaunchers, compile_launchers
@@ -210,24 +210,22 @@ def plan(
             ),
         )
 
-    def memory(config, device):
-        del config, device
-        required = (
-            int(query.setup["slab_nbytes"])
-            + int(query.setup["stage_nbytes"])
-            + 3 * int(query.setup["flag_slots"]) * 4
-        )
-        # The runtime owns its IPC slab/stage before declaration; preparation
-        # retains and reports the exact pre-existing resident envelope.
-        return MemoryRequirements(
+    required = (
+        int(query.setup["slab_nbytes"])
+        + int(query.setup["stage_nbytes"])
+        + 3 * int(query.setup["flag_slots"]) * 4
+    )
+    memory = FixedMemoryRequirements(
+        MemoryRequirements(
             persistent=(
                 PersistentMemory(
-                    key=(current_plan(), "pcie_dma_channel"),
+                    key=(id(runtime), "pcie_dma_channel"),
                     required_nbytes=required,
                     resident_nbytes=required,
                 ),
             )
         )
+    )
 
     def materialize(selection, device):
         from b12x._lib.compile_plan import load_programs
