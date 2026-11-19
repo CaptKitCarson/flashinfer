@@ -423,9 +423,11 @@ def test_tp4_plan_only_offers_pairwise_for_push(
     monkeypatch.setattr(manager, "_use_bf16_twoshot", lambda *args: prefer_twoshot)
 
     def query(owner, *, surface, call):
-        setup = dict(shape=(256,))
+        shape = tuple(call["inp"].shape)
         if owner is twoshot:
-            setup.update(slab_nbytes=16384, push_shard_nbytes=512)
+            setup = dict(slab_nbytes=16384, push_shard_nbytes=512)
+        else:
+            setup = dict(shape=shape)
         return PcieQuery(
             surface=surface,
             world_size=4,
@@ -439,8 +441,8 @@ def test_tp4_plan_only_offers_pairwise_for_push(
                     blocks=8,
                     block_limit=8,
                     dtype="bfloat16",
-                    shape=(256,),
-                    size_packs=32,
+                    shape=shape,
+                    size_packs=call["inp"].numel() // 8,
                 )
             ),
             setup=FrozenMapping(setup),
@@ -455,7 +457,15 @@ def test_tp4_plan_only_offers_pairwise_for_push(
     assert ("twoshot_pairwise" in plan.query.alternatives) == admitted
     assert "twoshot" in plan.query.alternatives
     assert "pull" in plan.query.alternatives
-    assert (plan.contract.collective_bucket(plan.query) is None) == admitted
+    bucket = plan.contract.collective_bucket(plan.query)
+    assert bucket.size_bytes == 512
+    assert bucket.parameters == ("implementation",)
+    assert bucket.limit == 2
+    assert set(bucket.identity["alternatives"]) == set(plan.query.alternatives)
+    larger = manager.plan(torch.empty(512, dtype=torch.bfloat16))
+    larger_bucket = larger.contract.collective_bucket(larger.query)
+    assert larger_bucket.size_bytes == 1024
+    assert larger_bucket.identity == bucket.identity
     expected = "twoshot" if prefer_twoshot else "pull"
     assert plan.query.default.implementation == expected
     with autotune_effort("default"):

@@ -98,7 +98,8 @@ Default-effort plain all-reduce tuning calibrates transfer-size buckets before
 restricting exact-shape races to two families. Bucket upper bounds are
 `1, 2, 4, 8, 16, 32, 48, 64, 96, 128` units of 8 KiB, then powers of two.
 Within a preparation batch, the largest declared payload in each bucket races
-all eligible families first. The winning family and the fastest other family
+all eligible families first. On TP4, direct and pairwise BF16 two-shot push
+compete as separate families. The winning family and the fastest other family
 remain eligible for every subsequent request in that bucket; each request
 still races all their eligible thread counts and block grids at its actual shape.
 Across preparation batches in one session, the first completed calibration for
@@ -127,10 +128,8 @@ Audit effort measures the unrestricted catalog. Explicit pins and disabled
 tuning bypass calibration. Caller-supplied benchmark contexts and dependent
 requests do not share built-in calibration. Requests retaining measured finalists
 preserve their complete family catalogs. Fused arithmetic and DCP operations
-retain their shape-specific searches. TP4 BF16 push all-reduce also measures
-the complete catalog at each shape when the device admits a pairwise two-shot
-candidate. Check performance within each bucket against audit races when changing transport
-kernels or bucket boundaries.
+retain their shape-specific searches. Check performance within each bucket
+against audit races when changing transport kernels or bucket boundaries.
 
 Hierarchical collectives, DMA rings, FP8 sequence-parallel transports, paired gathers,
 and owner/top-k exchanges retain their native fixed declarations. Transport

@@ -525,8 +525,6 @@ def _island_bucket(query):
 def _bucket(query):
     if query.operation != "all_reduce":
         return None
-    if "twoshot_pairwise" in query.alternatives:
-        return None
     if any(name in query.alternatives for name in ISLAND_VARIANTS):
         return _island_bucket(query)
     from math import prod
@@ -537,7 +535,12 @@ def _bucket(query):
         call, setup = payload["call"], payload["setup"]
         if call["dtype"] not in ("float16", "bfloat16"):
             return None
-        sizes.add(prod(call["shape"] if name == "twoshot" else setup["shape"]) * 2)
+        shape = (
+            call["shape"]
+            if payload["surface"] == "PCIeTwoShotBF16.all_reduce"
+            else setup["shape"]
+        )
+        sizes.add(prod(shape) * 2)
         alternatives[name] = dict(
             surface=payload["surface"],
             topology=payload["topology"],

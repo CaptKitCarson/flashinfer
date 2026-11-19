@@ -46,6 +46,24 @@ def query():
     )
 
 
+def runtime_for_query(q):
+    import torch
+
+    return SimpleNamespace(
+        device=torch.device("cpu"),
+        rank=q.rank,
+        world_size=q.world_size,
+        max_batch_size=q.setup["max_batch_size"],
+        total_heads=q.setup["total_heads"],
+        query_head_dim=q.setup["query_head_dim"],
+        _slot_bytes=q.setup["slot_bytes"],
+        _exchange_chunks=q.setup["exchange_chunks"],
+        _exchange_offset=q.setup["exchange_offset"],
+        _exchange_counter_offset=q.setup["exchange_counter_offset"],
+        _owned_buffers=(),
+    )
+
+
 @pytest.mark.parametrize(
     "operation, alternative",
     [("all_gather_heads", "dcp_ring"), ("lse_reduce_scatter", "dcp_pairwise")],
@@ -53,7 +71,6 @@ def query():
 def test_tp4_transport_race_retains_direct_candidate_and_default(
     operation, alternative
 ):
-    import torch
     from b12x.comm.pcie._preparation import plan as collective_plan
     from b12x.preparation import DeviceIdentity, autotune_effort
 
@@ -66,7 +83,8 @@ def test_tp4_transport_race_retains_direct_candidate_and_default(
         ),
         setup=FrozenMapping(dict(q.setup, threads_override=0, blocks_override=0)),
     )
-    prepared = collective_plan(q, runtime=SimpleNamespace(device=torch.device("cpu")))
+    prepared = collective_plan(q, runtime=runtime_for_query(q))
+    assert prepared.contract.collective_bucket(prepared.query) is None
     assert set(prepared.query.alternatives) == {"dcp", alternative}
     assert prepared.query.default.implementation == "dcp"
     device = DeviceIdentity("nvidia", (12, 0), 148, "synthetic SM120")
@@ -113,15 +131,8 @@ def test_selected_gather_rejects_incompatible_call(changes):
 def test_selected_gather_requires_matching_receive_owner():
     q = query()
     TUNING.validate_query(q, None)
-    runtime = SimpleNamespace(
-        max_batch_size=256,
-        total_heads=4,
-        query_head_dim=64,
-        _exchange_chunks=32,
-        _exchange_offset=131072,
-        _slot_bytes=262144,
-        _exchange_counter_offset=524288,
-    )
+    runtime = runtime_for_query(q)
+    runtime._exchange_chunks = 32
     with pytest.raises(ValueError, match="exchange_chunks differs"):
         plan(q, runtime=runtime, invocation=FrozenMapping(), override=None)
 
