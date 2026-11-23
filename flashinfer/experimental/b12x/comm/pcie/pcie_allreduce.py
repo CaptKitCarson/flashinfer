@@ -490,6 +490,7 @@ class PCIeAllReduce:
         override: PcieConfig | CollectiveConfig | None = None,
         joint_only: bool = False,
         joint_cluster_size: int = 1,
+        has_addend: bool = False,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
@@ -508,6 +509,10 @@ class PCIeAllReduce:
             raise ValueError(
                 "clustered joint planning requires joint_only=True and plain all_reduce"
             )
+        if has_addend and (joint_only or operation != "all_reduce"):
+            raise ValueError(
+                "fused input addend requires static plain all_reduce planning"
+            )
 
         if operation not in (
             "all_reduce",
@@ -522,10 +527,11 @@ class PCIeAllReduce:
             )
 
             target = self._runtime._prepared_channel_for_stream(stream, channel_id)
+            addend_call = {"has_addend": True} if has_addend else {}
             query = query_from_runtime(
                 target,
                 surface=f"OneshotAllReduce.{operation}",
-                call={"inp": inp, **call},
+                call={"inp": inp, **addend_call, **call},
             )
             if query.call["stage_input"]:
                 alternatives = oneshot_alternatives(query, target)
@@ -549,7 +555,7 @@ class PCIeAllReduce:
                     native = query_from_runtime(
                         twoshot,
                         surface="PCIeTwoShotBF16.all_reduce",
-                        call={"inp": inp, **call},
+                        call={"inp": inp, **addend_call, **call},
                     )
                     alternatives["twoshot"] = (native, twoshot)
                     if (
@@ -621,6 +627,10 @@ class PCIeAllReduce:
             raise ValueError(
                 "joint-only planning requires a staged all-peer BF16 collective"
             )
+        if has_addend:
+            raise ValueError(
+                "fused input addend requires a single-channel staged BF16 all-reduce"
+            )
         if operation == "all_reduce" and self._use_bf16_twoshot(inp, call.get("out")):
             query = query_from_runtime(
                 self._bf16_twoshot,
@@ -650,6 +660,7 @@ class PCIeAllReduce:
         *,
         plan: Plan,
         out: Optional[torch.Tensor] = None,
+        addend: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         blocks: Optional[int] = None,
         stream: object = None,
@@ -661,6 +672,7 @@ class PCIeAllReduce:
                 raise ValueError(
                     "two-shot all-reduce uses its prepared staging and launch geometry"
                 )
+            addend_kwargs = {"addend": addend} if addend is not None else {}
             if stream is not None:
                 with torch.cuda.stream(stream):
                     return self._bf16_twoshot.all_reduce(
@@ -669,6 +681,7 @@ class PCIeAllReduce:
                         out=out,
                         threads=state.query.call["threads"],
                         block_limit=state.query.call["block_limit"],
+                        **addend_kwargs,
                     )
             return self._bf16_twoshot.all_reduce(
                 inp,
@@ -676,8 +689,13 @@ class PCIeAllReduce:
                 out=out,
                 threads=state.query.call["threads"],
                 block_limit=state.query.call["block_limit"],
+                **addend_kwargs,
             )
         if self.algorithm == "hierarchical":
+            if addend is not None:
+                raise ValueError(
+                    "hierarchical all-reduce does not support fused addend"
+                )
             if peer_input_ptrs is not None:
                 raise ValueError(
                     "peer_input_ptrs are unavailable for hierarchical all-reduce"
@@ -699,6 +717,7 @@ class PCIeAllReduce:
             inp,
             plan=plan,
             out=out,
+            addend=addend,
             peer_input_ptrs=peer_input_ptrs,
             stream=stream,
             channel_id=channel_id,

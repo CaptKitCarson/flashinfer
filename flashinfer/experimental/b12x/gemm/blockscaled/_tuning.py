@@ -408,10 +408,11 @@ def mxfp8_a16_tc_gemv_eligible(query, device):
     )
 
 
-def mxfp8_a16_tc_gemv_splits(query):
+def mxfp8_a16_tc_gemv_splits(query, n_per_cta: int = 16):
     from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
 
-    n_blocks = (query.out_features + 15) // 16
+    n_per_cta = int(n_per_cta)
+    n_blocks = (query.out_features + n_per_cta - 1) // n_per_cta
     chunks = query.padded_in_features // 64
     cands = []
     if n_blocks >= 48 or chunks <= 2:
@@ -421,7 +422,7 @@ def mxfp8_a16_tc_gemv_splits(query):
             continue
         if query.workspace_nbytes is not None:
             needed = mxfp8_tc_gemv_workspace_bytes(
-                query.num_tokens, query.out_features, sk
+                query.num_tokens, query.out_features, sk, n_per_cta
             )
             if query.workspace_nbytes < needed:
                 continue
@@ -463,7 +464,7 @@ def _validate_config(query, config, device):
             raise ValueError("MXFP8 TC-GEMV A16 backend is ineligible for this query")
         if (
             config.tile_m not in (None, 16)
-            or config.tile_n != 16
+            or config.tile_n not in (16, 32)
             or config.tile_k != 64
             or type(config.split_k) is not int
             or config.split_k not in (1, 2, 4, 7, 8, 16)
@@ -475,10 +476,12 @@ def _validate_config(query, config, device):
             raise ValueError("invalid MXFP8 TC-GEMV A16 configuration")
         if query.workspace_nbytes is not None:
             needed = mxfp8_tc_gemv_workspace_bytes(
-                query.num_tokens, query.out_features, config.split_k
+                query.num_tokens, query.out_features, config.split_k, config.tile_n
             )
             if query.workspace_nbytes < needed:
-                raise ValueError("caller workspace is too small for MXFP8 TC-GEMV split-K")
+                raise ValueError(
+                    "caller workspace is too small for MXFP8 TC-GEMV split-K"
+                )
         return
     if config.dense_config is not None:
         if config.mode != "quantized" or query.recipe not in (
@@ -622,7 +625,9 @@ def _tuning_parameters(query, device):
 
     expanded = mxfp8_a16_dequant(query, BlockscaledConfig(mode="a16"))
     tc_gemv = mxfp8_a16_tc_gemv_eligible(query, device)
-    tc_splits = mxfp8_a16_tc_gemv_splits(query) if tc_gemv else ()
+    tc_splits_16 = mxfp8_a16_tc_gemv_splits(query, 16) if tc_gemv else ()
+    tc_n32_ok = tc_gemv and query.num_tokens >= 17 and query.out_features >= 512
+    tc_splits_32 = mxfp8_a16_tc_gemv_splits(query, 32) if tc_n32_ok else ()
 
     def eligible(parameters):
         if (
@@ -641,18 +646,26 @@ def _tuning_parameters(query, device):
             return True
         if parameters["a16_backend"] == "tc_gemv":
             if not (
-                tc_gemv
-                and parameters["tile_m"] == 16
-                and parameters["tile_n"] == 16
-                and parameters["tile_k"] == 64
-                and parameters["split_k"] in tc_splits
+                tc_gemv and parameters["tile_m"] == 16 and parameters["tile_k"] == 64
             ):
+                return False
+            if parameters["tile_n"] == 16:
+                if parameters["split_k"] not in tc_splits_16:
+                    return False
+            elif parameters["tile_n"] == 32 and tc_n32_ok:
+                if parameters["split_k"] not in tc_splits_32:
+                    return False
+            else:
                 return False
             chunks_per_split = (query.padded_in_features // 64) // parameters["split_k"]
             if chunks_per_split <= 4:
                 return parameters["mma_warps"] in (2, 4)
             return parameters["mma_warps"] in (4, 8)
-        if parameters["tile_n"] == 16 or parameters["mma_warps"] == 8 or parameters["split_k"] == 7:
+        if (
+            parameters["tile_n"] == 16
+            or parameters["mma_warps"] == 8
+            or parameters["split_k"] == 7
+        ):
             return False
         if parameters["tile_n"] == 32 and not (
             query.recipe == "mxfp8"
@@ -721,10 +734,7 @@ def _tuning_parameters(query, device):
             not tc_gemv
             or query.num_tokens > 28
             or query.activation_mode == "quantized"
-            or (
-                parameters["mode"] == "a16"
-                and parameters["a16_backend"] == "tc_gemv"
-            )
+            or (parameters["mode"] == "a16" and parameters["a16_backend"] == "tc_gemv")
         )
 
     a16_backends = ("auto",)
@@ -743,9 +753,7 @@ def _tuning_parameters(query, device):
             else ("a16", "quantized")
             if query.activation_mode == "auto"
             else (query.activation_mode,),
-            "mma_warps": (
-                (2, 4, 8) if tc_gemv else (2, 4)
-            )
+            "mma_warps": ((2, 4, 8) if tc_gemv else (2, 4))
             if query.recipe == "mxfp8"
             else (None,),
             "dense_config": dense_configs,
@@ -794,6 +802,7 @@ def _equivalence(query, device, config):
         return {
             "mode": "a16",
             "backend": "tc_gemv",
+            "tile_n": config.tile_n,
             "split_k": config.split_k,
             "warps": effective_mxfp8_tc_gemv_warps(
                 query.padded_in_features, config.split_k, config.mma_warps or 8
@@ -826,7 +835,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=59,
+    candidate_contract_version=60,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE
@@ -843,7 +852,9 @@ TUNING = TuningContract(
         ),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(
-            name="split_k", values=(1, 2, 4, 7, 8, 16), when=FrozenMapping({"mode": "a16"})
+            name="split_k",
+            values=(1, 2, 4, 7, 8, 16),
+            when=FrozenMapping({"mode": "a16"}),
         ),
         Knob(
             name="mma_warps",

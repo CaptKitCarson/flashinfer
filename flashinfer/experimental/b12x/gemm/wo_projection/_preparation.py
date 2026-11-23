@@ -264,6 +264,21 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
         return ordinary[key]
 
     def memory(config, device):
+        if config.backend == "a16_tc_gemv":
+            from b12x._lib.scratch import scratch_buffer_spec
+            from ._tc_gemv import wo_a16_tc_gemv_scratch_bytes
+
+            nbytes = wo_a16_tc_gemv_scratch_bytes(
+                caps.max_tokens, caps.groups, caps.rank, config.wo_a_split_k
+            )
+            scratch = (
+                scratch_buffer_spec(
+                    "wo_projection.a16_scratch",
+                    nbytes=nbytes,
+                    device=torch.device("cuda", device.ordinal),
+                ),
+            )
+            return MemoryRequirements(scratch=scratch, persistent=())
         scratch = _materialize_wo_projection_scratch(
             caps, config=config
         ).scratch_specs()
@@ -277,36 +292,50 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
         )
         return MemoryRequirements(scratch=scratch, persistent=persistent)
 
-    def materialize(selection, device):
-        from b12x._lib.dense_gemm.preparation import (
-            _materialize_dense,
-            _materialize_dense_fused_quant,
-        )
-        from .._shared.wo_mxfp8 import compile_wo_quantizers
-
-        a_lowering, b_lowering = ordinary_states(selection.config, device)
-        return _PreparedWO(
-            _materialize_wo_projection_scratch(caps, config=selection.config),
-            query,
-            _materialize_dense(a_lowering, torch.device("cuda", device.ordinal)),
-            _materialize_dense(b_lowering, torch.device("cuda", device.ordinal)),
-            (
-                _materialize_dense_fused_quant(
-                    fused_b(selection.config, device),
-                    torch.device("cuda", device.ordinal),
-                )
-                if use_fused_b
-                else None
-            ),
-            compile_wo_quantizers(_compile_query_payload(query), device.ordinal),
+    def _a16_woa_args(config):
+        inv_rope = query.operation == "inv_rope"
+        head_dim = (query.nope_dim + query.rope_dim) if inv_rope else 512
+        return (
+            caps.groups,
+            caps.rank,
+            caps.group_width,
+            caps.max_tokens,
+            config.wo_a_split_k,
+            config.wo_a_warps,
+            inv_rope,
+            head_dim,
+            query.nope_dim if inv_rope else 448,
+            query.rope_dim if inv_rope else 64,
+            query.positions_dtype,
         )
 
-    return Plan(
-        contract=TUNING,
-        query=query,
-        invocation=invocation,
-        override=override,
-        _compile_jobs=lambda config, device: (
+    def _a16_wob_args(config):
+        k_b = caps.groups * caps.rank
+        return (
+            caps.hidden,
+            k_b,
+            k_b,
+            caps.max_tokens,
+            1,
+            config.wo_b_warps,
+            config.decode_tile_n,
+        )
+
+    def compile_jobs(config, device):
+        if config.backend == "a16_tc_gemv":
+            return (
+                CompileJob.create(
+                    "b12x.gemm.wo_projection._tc_gemv:compile_grouped_woa_tc_gemv",
+                    CompileJob.DEVICE_ORDINAL,
+                    *_a16_woa_args(config),
+                ),
+                CompileJob.create(
+                    "b12x.gemm.blockscaled._mxfp8_tc_gemv:compile_mxfp8_tc_gemv",
+                    CompileJob.DEVICE_ORDINAL,
+                    *_a16_wob_args(config),
+                ),
+            )
+        return (
             CompileJob.create(
                 "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
                 ordinary_states(config, device)[0].to_dict(),
@@ -333,12 +362,248 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                 _compile_query_payload(query),
                 CompileJob.DEVICE_ORDINAL,
             ),
-        ),
+        )
+
+    def materialize(selection, device):
+        config = selection.config
+        if config.backend == "a16_tc_gemv":
+            from b12x.gemm.blockscaled._mxfp8_tc_gemv import compile_mxfp8_tc_gemv
+            from ._tc_gemv import compile_grouped_woa_tc_gemv
+
+            a_fn = compile_grouped_woa_tc_gemv(device.ordinal, *_a16_woa_args(config))
+            b_fn = compile_mxfp8_tc_gemv(device.ordinal, *_a16_wob_args(config))
+            return _PreparedWO(
+                _A16WOScratchState(caps, config),
+                query,
+                None,
+                None,
+                None,
+                None,
+                a16_wo_a=a_fn,
+                a16_wo_b=b_fn,
+                a16_woa_flags=None,
+                a16_split_k=config.wo_a_split_k,
+            )
+        from b12x._lib.dense_gemm.preparation import (
+            _materialize_dense,
+            _materialize_dense_fused_quant,
+        )
+        from .._shared.wo_mxfp8 import compile_wo_quantizers
+
+        a_lowering, b_lowering = ordinary_states(config, device)
+        return _PreparedWO(
+            _materialize_wo_projection_scratch(caps, config=config),
+            query,
+            _materialize_dense(a_lowering, torch.device("cuda", device.ordinal)),
+            _materialize_dense(b_lowering, torch.device("cuda", device.ordinal)),
+            (
+                _materialize_dense_fused_quant(
+                    fused_b(config, device),
+                    torch.device("cuda", device.ordinal),
+                )
+                if use_fused_b
+                else None
+            ),
+            compile_wo_quantizers(_compile_query_payload(query), device.ordinal),
+        )
+
+    return Plan(
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        _compile_jobs=compile_jobs,
         _memory_requirements=memory,
         _materialize=materialize,
         _device=caps.device,
         shared=True,
     )
+
+
+class _A16WOScratchState:
+    """Minimal scratch state for the A16 TC-GEMV WO backend."""
+
+    def __init__(self, caps: WOProjectionScratchCaps, config):
+        from b12x._lib.scratch import scratch_buffer_spec
+        from ._tc_gemv import wo_a16_tc_gemv_scratch_bytes
+
+        self.caps = caps
+        self.config = config
+        nbytes = wo_a16_tc_gemv_scratch_bytes(
+            caps.max_tokens, caps.groups, caps.rank, config.wo_a_split_k
+        )
+        self._specs = (
+            scratch_buffer_spec(
+                "wo_projection.a16_scratch", nbytes=nbytes, device=caps.device
+            ),
+        )
+
+    def scratch_specs(self):
+        return self._specs
+
+    def _check_caps(self, weights):
+        if (
+            weights.groups != self.caps.groups
+            or weights.group_width != self.caps.group_width
+            or weights.rank != self.caps.rank
+            or weights.hidden != self.caps.hidden
+        ):
+            raise ValueError(
+                "WO weights geometry differs from prepared caps: "
+                f"got {(weights.groups, weights.group_width, weights.rank, weights.hidden)}, "
+                f"expected {(self.caps.groups, self.caps.group_width, self.caps.rank, self.caps.hidden)}"
+            )
+
+    def _slice_scratch(self, scratch, tokens, out):
+        from b12x._lib.scratch import scratch_tensor
+        from ._tc_gemv import wo_a16_tc_gemv_splitk_bytes, wo_a16_tc_gemv_tmp_bytes
+
+        storage = scratch_tensor(scratch, self._specs, owner="WO A16 projection")
+        tmp_bytes = wo_a16_tc_gemv_tmp_bytes(
+            self.caps.max_tokens, self.caps.groups, self.caps.rank
+        )
+        tmp = (
+            storage[: tokens * self.caps.groups * self.caps.rank * 2]
+            .view(torch.bfloat16)
+            .view(tokens, self.caps.groups * self.caps.rank)
+        )
+        if self.config.wo_a_split_k > 1:
+            splitk_bytes = wo_a16_tc_gemv_splitk_bytes(
+                self.caps.max_tokens,
+                self.caps.groups,
+                self.caps.rank,
+                self.config.wo_a_split_k,
+            )
+            splitk_scratch = storage[tmp_bytes : tmp_bytes + splitk_bytes].view(
+                torch.float32
+            )
+            n_blocks = self.caps.groups * ((self.caps.rank + 15) // 16)
+            flags_start = tmp_bytes + splitk_bytes
+            splitk_flags = storage[flags_start : flags_start + n_blocks * 4].view(
+                torch.uint32
+            )
+        else:
+            splitk_scratch = None
+            splitk_flags = None
+        if out is None:
+            out = torch.empty(
+                (tokens, self.caps.hidden),
+                dtype=torch.bfloat16,
+                device=storage.device,
+            )
+        if out.dtype != torch.bfloat16:
+            raise ValueError(f"WO output must be torch.bfloat16, got {out.dtype}")
+        if out.device != storage.device or not out.is_contiguous():
+            raise ValueError("WO output must be contiguous on the scratch device")
+        if out.shape not in ((tokens, self.caps.hidden), (tokens, self.caps.hidden, 1)):
+            raise ValueError(
+                "WO output must have shape [tokens, hidden] or [tokens, hidden, 1]"
+            )
+        output = out.as_strided(
+            (tokens, self.caps.hidden, 1),
+            (self.caps.hidden, 1, tokens * self.caps.hidden),
+        )
+        return tmp, splitk_scratch, splitk_flags, output
+
+    def bind(
+        self,
+        *,
+        scratch,
+        source_tgd,
+        weights,
+        out=None,
+        return_3d=False,
+        expected_m=None,
+    ):
+        from .._shared.wo_mxfp8 import (
+            WOProjectionBinding,
+            _validate_wo_projection_inputs,
+        )
+
+        self._check_caps(weights)
+        tokens = _validate_wo_projection_inputs(source_tgd, weights)
+        tmp, splitk_scratch, splitk_flags, output = self._slice_scratch(
+            scratch, tokens, out
+        )
+        return WOProjectionBinding(
+            source_tgd=source_tgd,
+            weights=weights,
+            x_q=splitk_scratch,
+            tmp=tmp,
+            tmp_q=splitk_flags,
+            output=output,
+            return_3d=return_3d,
+            expected_m=expected_m,
+        )
+
+    def bind_inv_rope(
+        self,
+        *,
+        scratch,
+        o,
+        positions,
+        cos_sin_cache,
+        weights,
+        heads_per_group,
+        out=None,
+        nope_dim=448,
+        rope_dim=64,
+        return_3d=False,
+        expected_m=None,
+    ):
+        from .._shared.wo_mxfp8 import (
+            WOProjectionInvRopeBinding,
+            _validate_wo_projection_inv_rope_inputs,
+        )
+
+        self._check_caps(weights)
+        tokens = _validate_wo_projection_inv_rope_inputs(
+            o=o,
+            weights=weights,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+        )
+        if (
+            positions.device != o.device
+            or positions.ndim != 1
+            or not positions.is_contiguous()
+            or positions.shape[0] < tokens
+        ):
+            raise ValueError(
+                "WO inverse-RoPE positions must be a contiguous 1D tensor on the input device with at least tokens entries"
+            )
+        if (
+            cos_sin_cache.device != o.device
+            or cos_sin_cache.ndim != 2
+            or cos_sin_cache.shape[1] < rope_dim
+            or cos_sin_cache.stride(1) != 1
+            or cos_sin_cache.data_ptr() % 16 != 0
+            or (cos_sin_cache.stride(0) * cos_sin_cache.element_size()) % 16 != 0
+            or rope_dim % 8 != 0
+            or nope_dim % 8 != 0
+        ):
+            raise ValueError(
+                "WO inverse-RoPE cos_sin_cache must be a 16-byte aligned 2D tensor with unit inner stride and 16-byte aligned row stride on the input device"
+            )
+        tmp, splitk_scratch, splitk_flags, output = self._slice_scratch(
+            scratch, tokens, out
+        )
+        return WOProjectionInvRopeBinding(
+            o=o,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            weights=weights,
+            x_q=splitk_scratch,
+            tmp=tmp,
+            tmp_q=splitk_flags,
+            output=output,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            return_3d=return_3d,
+            expected_m=expected_m,
+        )
 
 
 @dataclass(frozen=True)
@@ -351,6 +616,10 @@ class _PreparedWO:
     ordinary_b: object
     fused_b: object
     quantizers: object
+    a16_wo_a: object = None
+    a16_wo_b: object = None
+    a16_woa_flags: object = None
+    a16_split_k: int = 1
 
     def bind(self, **kwargs):
         if self.query.operation != "plain":
@@ -407,6 +676,13 @@ class _PreparedWO:
         if not self.query.dynamic_tokens and int(tokens) != self.query.max_tokens:
             raise ValueError("WO plan requires its exact prepared token count")
 
+    def _get_quantizers(self, device):
+        if self.quantizers is not None:
+            return self.quantizers
+        from .._shared.wo_mxfp8 import compile_wo_quantizers
+
+        return compile_wo_quantizers(_compile_query_payload(self.query), device.index)
+
     def quantize_a(self, source_tgd, *, out=None):
         from .._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 
@@ -418,7 +694,7 @@ class _PreparedWO:
                 num_groups=self.query.groups,
                 device=source_tgd.device,
             )
-        self.quantizers.quantize_a(source_tgd, out)
+        self._get_quantizers(source_tgd.device).quantize_a(source_tgd, out)
         return out
 
     def quantize_a_inv_rope(
@@ -450,7 +726,7 @@ class _PreparedWO:
                 num_groups=self.query.groups,
                 device=o.device,
             )
-        self.quantizers.quantize_a_inv_rope(
+        self._get_quantizers(o.device).quantize_a_inv_rope(
             o,
             positions,
             cos_sin_cache,
@@ -473,10 +749,44 @@ class _PreparedWO:
                 num_groups=1,
                 device=tmp_trg.device,
             )
-        self.quantizers.quantize_b(tmp_trg, out)
+        self._get_quantizers(tmp_trg.device).quantize_b(tmp_trg, out)
         return out
 
     def run(self, binding, *, stream=None):
+        if self.a16_wo_a is not None:
+            from b12x._lib.utils.device import cuda_stream_to_int
+
+            stream_int = cuda_stream_to_int(stream)
+            flags = binding.tmp_q if self.a16_split_k > 1 else None
+            if flags is not None:
+                if stream_int is not None:
+                    with torch.cuda.stream(
+                        torch.cuda.ExternalStream(stream_int, device=flags.device)
+                    ):
+                        flags.zero_()
+                else:
+                    flags.zero_()
+            self.a16_wo_a(
+                binding.source_tgd,
+                None,
+                None,
+                binding.weights.wo_a.values,
+                binding.weights.wo_a.scale_mma,
+                binding.tmp,
+                binding.x_q if self.a16_split_k > 1 else None,
+                flags,
+                stream_int,
+            )
+            self.a16_wo_b(
+                binding.tmp,
+                binding.weights.wo_b.values,
+                binding.weights.wo_b.scale_mma,
+                binding.output[:, :, 0],
+                None,
+                None,
+                stream_int,
+            )
+            return binding.output if binding.return_3d else binding.output[:, :, 0]
         tokens = binding.source_tgd.shape[0]
         self.quantizers.quantize_a(binding.source_tgd, binding.x_q)
         a_values = binding.weights.wo_a.values
@@ -531,6 +841,40 @@ class _PreparedWO:
         return binding.output if binding.return_3d else binding.output[:, :, 0]
 
     def run_inv_rope(self, binding, *, stream=None):
+        if self.a16_wo_a is not None:
+            from b12x._lib.utils.device import cuda_stream_to_int
+
+            stream_int = cuda_stream_to_int(stream)
+            flags = binding.tmp_q if self.a16_split_k > 1 else None
+            if flags is not None:
+                if stream_int is not None:
+                    with torch.cuda.stream(
+                        torch.cuda.ExternalStream(stream_int, device=flags.device)
+                    ):
+                        flags.zero_()
+                else:
+                    flags.zero_()
+            self.a16_wo_a(
+                binding.o,
+                binding.positions,
+                binding.cos_sin_cache,
+                binding.weights.wo_a.values,
+                binding.weights.wo_a.scale_mma,
+                binding.tmp,
+                binding.x_q if self.a16_split_k > 1 else None,
+                flags,
+                stream_int,
+            )
+            self.a16_wo_b(
+                binding.tmp,
+                binding.weights.wo_b.values,
+                binding.weights.wo_b.scale_mma,
+                binding.output[:, :, 0],
+                None,
+                None,
+                stream_int,
+            )
+            return binding.output if binding.return_3d else binding.output[:, :, 0]
         tokens = binding.o.shape[0]
         self.quantizers.quantize_a_inv_rope(
             binding.o,

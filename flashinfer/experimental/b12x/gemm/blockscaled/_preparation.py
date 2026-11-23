@@ -148,6 +148,7 @@ def compile_packed(
                         query.num_tokens,
                         config.split_k,
                         config.mma_warps or 8,
+                        config.tile_n or 16,
                     ),
                     **activation_program,
                 }
@@ -204,7 +205,11 @@ def compile_packed(
                     query.out_features, slices, ordinal
                 )
             if mxfp8_a16_dequant(query, config):
-                from ._dequant import DEQUANT_BLOCK_K, DEQUANT_BLOCK_R, _dequantize_mxfp8
+                from ._dequant import (
+                    DEQUANT_BLOCK_K,
+                    DEQUANT_BLOCK_R,
+                    _dequantize_mxfp8,
+                )
 
                 k = query.padded_in_features
                 programs["dequant"] = _dequantize_mxfp8.warmup(
@@ -329,7 +334,10 @@ def _projection_workspace_bytes(query, config, device):
             from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
 
             return mxfp8_tc_gemv_workspace_bytes(
-                query.num_tokens, query.out_features, config.split_k
+                query.num_tokens,
+                query.out_features,
+                config.split_k,
+                config.tile_n or 16,
             )
         slices = effective_a16_config(query, config)[2]
         partials = (
@@ -461,7 +469,9 @@ class _PackedExecutionState:
         source_align_ok = bool(source.data_ptr() % 16 == 0) and source_layout_ok
         if is_tc_gemv:
             if not source_layout_ok or (source_align_ok != q.source_aligned and m):
-                raise ValueError("packed TC-GEMV source layout differs from preparation")
+                raise ValueError(
+                    "packed TC-GEMV source layout differs from preparation"
+                )
         elif source.is_contiguous() != q.source_contiguous or (
             bool(source.data_ptr() % 16 == 0) != q.source_aligned and m
         ):
@@ -615,7 +625,15 @@ class _PackedExecutionState:
                         triton.cdiv(k, DEQUANT_BLOCK_K),
                         1,
                     )
-                ](values, scale_bytes, weight, q.out_features, k, DEQUANT_BLOCK_R, DEQUANT_BLOCK_K)
+                ](
+                    values,
+                    scale_bytes,
+                    weight,
+                    q.out_features,
+                    k,
+                    DEQUANT_BLOCK_R,
+                    DEQUANT_BLOCK_K,
+                )
                 torch.mm(
                     source.view(m, q.in_features),
                     weight.t(),
@@ -623,11 +641,7 @@ class _PackedExecutionState:
                 )
                 return out
             if config.mode == "a16" and config.a16_backend == "tc_gemv":
-                src_2d = (
-                    source
-                    if source.ndim == 2
-                    else source.view(m, q.in_features)
-                )
+                src_2d = source if source.ndim == 2 else source.view(m, q.in_features)
                 self.programs["gemm"](
                     src_2d,
                     values,
@@ -824,12 +838,16 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         ):
             from ._mxfp8_tc_gemv import _FLAGS_CACHE, mxfp8_tc_gemv_flags_bytes
 
-            fbytes = mxfp8_tc_gemv_flags_bytes(query.out_features, config.split_k)
+            n_per_cta = config.tile_n or 16
+            fbytes = mxfp8_tc_gemv_flags_bytes(
+                query.out_features, config.split_k, n_per_cta
+            )
             fkey = (
                 device.ordinal,
                 query.out_features,
                 query.padded_in_features,
                 config.split_k,
+                n_per_cta,
             )
             persistent.append(
                 PersistentMemory(
@@ -944,6 +962,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
                 query.out_features,
                 query.padded_in_features,
                 config.split_k,
+                config.tile_n or 16,
             )
         return _PackedExecutionState(
             query,

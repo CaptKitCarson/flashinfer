@@ -141,17 +141,29 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             and value.data_ptr() < out.data_ptr() + out.nbytes
             and out.data_ptr() < value.data_ptr() + value.nbytes
         )
+        gather_transport = call.get("gather_transport", "barrier")
+        has_gate = bool(call.get("has_gate", call.get("gate") is not None))
+        if has_gate and gather_transport not in ("barrier", "word_exchange"):
+            raise ValueError(
+                "gated all_gather_heads requires barrier or word_exchange transport"
+            )
         metadata.update(
             dtype=str(value.dtype),
             shape=tuple(value.shape),
             stride=tuple(value.stride()),
-            gather_transport="barrier",
+            gather_transport=gather_transport,
             disjoint_output=not overlaps,
             word_aligned=value.data_ptr() % 4 == 0
             and (out is None or out.data_ptr() % 4 == 0),
             pack_aligned=value.data_ptr() % 16 == 0
             and (out is None or out.data_ptr() % 16 == 0),
         )
+        if has_gate:
+            metadata["has_gate"] = True
+        if "submode" in call:
+            metadata["submode"] = call["submode"]
+        if "active_blocks" in call:
+            metadata["active_blocks"] = int(call["active_blocks"])
     elif surface.endswith("all_gather_pair"):
         from .pcie_dcp_a2a import _pair_outputs_disjoint
 
@@ -250,6 +262,7 @@ def compile_dcp_surface(query_payload, ordinal):
                 for slot in (False, True)
             }
         if surface.endswith("all_gather_heads"):
+            has_gate = bool(call.get("has_gate", False))
             if call.get("gather_transport") == "word_exchange":
                 from ._word_exchange import compile_word_exchange
 
@@ -262,11 +275,16 @@ def compile_dcp_surface(query_payload, ordinal):
                     int(call["threads"]),
                     int(call["block_limit"]),
                     int(query.setup["exchange_chunks"]),
+                    has_gate=has_gate,
                 )
                 return {False: program, True: program}
             return {
                 slot: cute._get_compiled_all_gather_heads(
-                    query.world_size, query.rank, int(call["threads"]), slot
+                    query.world_size,
+                    query.rank,
+                    int(call["threads"]),
+                    slot,
+                    has_gate=has_gate,
                 )
                 for slot in (False, True)
             }
@@ -343,12 +361,14 @@ class _DcpExecutionState:
                 block_limit=call.get("block_limit", self.query.call["block_limit"]),
             )
         if surface.endswith("all_gather_heads"):
+            gate_kwargs = {"gate": call["gate"]} if call.get("gate") is not None else {}
             return self.runtime._all_gather_heads_on_device(
                 call["local_input"],
                 call.get("out"),
                 state=self,
                 threads=call.get("threads", self.query.call["threads"]),
                 block_limit=call.get("block_limit", self.query.call["block_limit"]),
+                **gate_kwargs,
             )
         if surface.endswith("all_gather_pair_kimi_topk"):
             return self.runtime._all_gather_pair_kimi_topk_on_device(

@@ -1076,8 +1076,15 @@ class PCIeDCPA2A:
         plan: Plan,
         threads: int | None = None,
         block_limit: int | None = None,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Gather rank-local heads into a rank-major head dimension."""
+        """Gather rank-local heads into a rank-major head dimension.
+
+        When a prepared gated plan is used with ``gate``, every participating
+        rank must pass a gate with the same zero/nonzero truth value because
+        each CTA skips the collective protocol directly on GPU without an extra
+        barrier.
+        """
         with _device_guard(self.device):
             return self._all_gather_heads_on_device(
                 local_input,
@@ -1085,6 +1092,7 @@ class PCIeDCPA2A:
                 state=self._prepared_state(plan),
                 threads=threads,
                 block_limit=block_limit,
+                gate=gate,
             )
 
     def _all_gather_heads_on_device(
@@ -1095,6 +1103,7 @@ class PCIeDCPA2A:
         state,
         threads: int,
         block_limit: int,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self._check_stream()
         if self._closed:
@@ -1117,7 +1126,15 @@ class PCIeDCPA2A:
             )
         if not local_input.is_contiguous():
             raise ValueError("input must be contiguous")
+        from ._gather_preparation import SelectedGatherState
+
         expected_out = (batch, self.total_heads, self.query_head_dim)
+        has_gate = bool(state.query.call.get("has_gate", False))
+        if has_gate and out is None:
+            raise ValueError(
+                "gated all_gather_heads requires caller-provided out "
+                "(a zero gate leaves out unchanged)"
+            )
         if out is None:
             out = torch.empty(
                 expected_out,
@@ -1143,12 +1160,41 @@ class PCIeDCPA2A:
         )
         if threads != state.query.call["threads"]:
             raise ValueError("DCP threads differ from the prepared launcher")
-        from ._gather_preparation import SelectedGatherState
-
         if isinstance(state, SelectedGatherState):
+            if gate is not None:
+                raise ValueError(
+                    "gate is only supported for static barrier/word_exchange gathers"
+                )
             if block_limit != state.query.call["block_limit"]:
                 raise ValueError("DCP grid differs from the prepared gather")
             return state.run_selected(local_input, out)
+        if has_gate:
+            if (
+                gate is None
+                or gate.device != self.device
+                or gate.dtype not in (torch.int32, torch.uint32)
+                or gate.numel() < 1
+                or not gate.is_contiguous()
+                or gate.data_ptr() % 4
+            ):
+                raise ValueError(
+                    "gated all_gather_heads requires a contiguous aligned int32 CUDA gate"
+                )
+            gate_bytes = gate.numel() * gate.element_size()
+            if (
+                gate.data_ptr() < out.data_ptr() + out.nbytes
+                and out.data_ptr() < gate.data_ptr() + gate_bytes
+            ):
+                raise ValueError(
+                    "gated all_gather_heads requires gate storage disjoint from output"
+                )
+            gate_ptr = gate.data_ptr()
+        else:
+            if gate is not None:
+                raise ValueError(
+                    "ungated all_gather_heads plan does not accept a gate tensor"
+                )
+            gate_ptr = None
         if state.query.call.get("gather_transport") == "word_exchange":
             if str(local_input.dtype) != state.query.call["dtype"]:
                 raise ValueError(
@@ -1172,6 +1218,7 @@ class PCIeDCPA2A:
                     raise ValueError(
                         "word exchange plan does not match its owned state"
                     )
+            gate_kwargs = {"gate_address": gate_ptr} if gate_ptr is not None else {}
             state.launcher(False)(
                 local_input.data_ptr(),
                 out.data_ptr(),
@@ -1180,6 +1227,7 @@ class PCIeDCPA2A:
                 self._exchange_offset,
                 self._exchange_counter_offset,
                 int(batch),
+                **gate_kwargs,
             )
             return out
         rows = int(batch) * self.total_heads
@@ -1197,6 +1245,7 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                has_gate=has_gate,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "
@@ -1218,6 +1267,7 @@ class PCIeDCPA2A:
             blocks=blocks,
             device_slot_selection=self._device_slot_selection,
             launcher=state.launcher(self._device_slot_selection),
+            gate_ptr=gate_ptr,
         )
         return out
 
@@ -1231,9 +1281,11 @@ class PCIeDCPA2A:
         blocks: int,
         device_slot_selection: bool,
         launcher,
+        gate_ptr: int | None = None,
     ) -> None:
         from ._dcp_a2a_cute import all_gather_heads
 
+        gate_kwargs = {"gate_ptr": gate_ptr} if gate_ptr is not None else {}
         with torch.cuda.device(self.device):
             all_gather_heads(
                 world_size=self.world_size,
@@ -1251,6 +1303,7 @@ class PCIeDCPA2A:
                 slot_delta_bytes=(self._slot_bytes if slot == 0 else -self._slot_bytes),
                 blocks=blocks,
                 launcher=launcher,
+                **gate_kwargs,
             )
 
     def all_gather_pair(
@@ -2247,11 +2300,13 @@ class PCIeDCPA2APool:
         plan: Plan,
         threads=None,
         block_limit=None,
+        gate=None,
         stream=None,
         channel_id=None,
     ):
         channel = self.for_stream(stream, channel_id=channel_id)
         channel._prepared_state(plan)
+        gate_kwargs = {"gate": gate} if gate is not None else {}
         with _device_guard(self.device):
             if stream is not None and self.device.type == "cuda":
                 with torch.cuda.stream(stream):
@@ -2261,9 +2316,15 @@ class PCIeDCPA2APool:
                         plan=plan,
                         threads=threads,
                         block_limit=block_limit,
+                        **gate_kwargs,
                     )
             return channel.all_gather_heads(
-                local_input, out, plan=plan, threads=threads, block_limit=block_limit
+                local_input,
+                out,
+                plan=plan,
+                threads=threads,
+                block_limit=block_limit,
+                **gate_kwargs,
             )
 
     def all_gather_pair(
